@@ -1,8 +1,7 @@
 # HOMR OMR — RunPod Serverless Endpoint
 # Licensed under AGPL-3.0 (required by HOMR's license)
 #
-# Lightweight build: python-slim + onnxruntime-gpu (bundles its own CUDA libs).
-# No full CUDA base image needed since HOMR is ONNX-only.
+# Uses runpod/base with CUDA for GPU inference via onnxruntime-gpu.
 
 FROM runpod/base:0.6.2-cuda12.2.0
 
@@ -10,7 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     NVIDIA_VISIBLE_DEVICES=all
 
-# Minimal system deps for OpenCV headless + image processing
+# System deps for OpenCV headless + image processing
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
@@ -19,12 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python dependencies
+# Install Python dependencies using the same python3 that will run the handler
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir --upgrade pip && \
-    pip3 install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+    python3 -m pip install --no-cache-dir -r requirements.txt
 
-# Pre-download HOMR models during build (avoids cold-start download)
+# Pre-download HOMR models during build
 RUN python3 -c "from homr.main import download_weights; download_weights(use_gpu_inference=True)"
 
 # Copy handler code
