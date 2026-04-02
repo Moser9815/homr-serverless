@@ -27,6 +27,7 @@ except ImportError:
 import runpod
 
 from parse_musicxml import parse_musicxml_to_json
+from detect_voltas import detect_voltas
 
 
 def decode_image(base64_data: str) -> Image.Image:
@@ -132,10 +133,17 @@ def handler(event):
 
             processing_time = time.time() - start_time
 
+            # Post-process: detect volta brackets HOMR missed
+            repeat_markers = parsed.get("repeat_markers", [])
+            if repeat_markers:
+                try:
+                    repeat_markers = detect_voltas(tmp_path, repeat_markers)
+                except Exception as e:
+                    print(f"[volta] Detection failed (non-fatal): {e}")
+
             # Build response
             notes = parsed.get("notes", [])
             rests = parsed.get("rests", [])
-            repeat_markers = parsed.get("repeat_markers", [])
             metadata = parsed.get("metadata", {})
             metadata["processing_time"] = round(processing_time, 2)
             metadata["detection_method"] = "homr"
