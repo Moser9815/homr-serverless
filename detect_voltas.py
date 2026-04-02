@@ -2,35 +2,24 @@
 Volta Bracket Detector — Post-processing for HOMR OMR output.
 
 HOMR's transformer doesn't reliably detect volta brackets (1st/2nd endings)
-due to training data scarcity. This module uses OpenCV + OCR to detect them
-from the original image and merge them with HOMR's repeat barlines.
+due to training data scarcity. This module uses OCR to detect "1" / "2" text
+above staves and creates repeat markers with volta endings.
 
 This code is licensed under AGPL-3.0 to comply with HOMR's license.
 """
 
 import cv2
 import numpy as np
-from typing import Optional
 
 
 def detect_voltas(
     image_path: str,
     repeat_markers: list[dict],
+    total_measures: int = 0,
 ) -> list[dict]:
     """
-    Detect volta brackets in a sheet music image and merge with repeat markers.
-
-    Args:
-        image_path: Path to the sheet music image
-        repeat_markers: Repeat markers from HOMR's MusicXML (list of dicts
-            with start_measure, end_measure, repeat_count, volta_endings)
-
-    Returns:
-        Updated repeat_markers with volta_endings populated where detected.
+    Detect volta brackets and merge with HOMR's repeat markers.
     """
-    if not repeat_markers:
-        return repeat_markers
-
     img = cv2.imread(image_path)
     if img is None:
         print(f"[volta] Could not read image: {image_path}")
@@ -39,7 +28,6 @@ def detect_voltas(
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
-    # Step 1: Find staff positions
     staves = _find_staves(gray, w, h)
     if not staves:
         print("[volta] No staves found")
@@ -47,17 +35,121 @@ def detect_voltas(
 
     print(f"[volta] Found {len(staves)} staves")
 
-    # Step 2: Find volta text ("1", "2", "1.", "2.") above each staff
-    volta_texts = _find_volta_texts(img, staves)
+    volta_texts, staff_measures = _find_volta_texts_and_measures(img, staves)
     if not volta_texts:
         print("[volta] No volta text detected")
         return repeat_markers
 
-    print(f"[volta] Found {len(volta_texts)} volta texts: {volta_texts}")
+    summary = [(v["number"], v["staff_index"], v["x"]) for v in volta_texts]
+    print(f"[volta] Found {len(volta_texts)} volta texts: {summary}")
+    print(f"[volta] Staff measures: {staff_measures}")
 
-    # Step 3: Map volta texts to staves → measures → repeat markers
-    updated = _merge_voltas_into_repeats(volta_texts, staves, repeat_markers)
-    return updated
+    if total_measures == 0:
+        all_m = [rm["end_measure"] for rm in repeat_markers] if repeat_markers else [1]
+        total_measures = max(all_m)
+
+    # Group volta texts by staff
+    by_staff: dict[int, list[dict]] = {}
+    for vt in volta_texts:
+        by_staff.setdefault(vt["staff_index"], []).append(vt)
+
+    # For each staff with a volta pair, determine the measure range
+    # using OCR-detected measure numbers (not estimation)
+    volta_groups = []
+    num_staves = len(staves)
+    measures_per_staff = max(1, total_measures / num_staves)
+
+    for si, texts in by_staff.items():
+        volta_numbers = sorted(set(v["number"] for v in texts))
+        if len(volta_numbers) < 2:
+            continue
+
+        # Volta text above staff N belongs to the staff ABOVE (N-1).
+        # The volta bracket marks the end of a repeated section on the
+        # previous line. Use the previous staff's measures, or if the current
+        # staff has measures, the measures just before the current staff's first.
+        prev_si = si - 1
+        prev_measures = staff_measures.get(prev_si, [])
+        curr_measures = staff_measures.get(si, [])
+
+        if prev_measures and curr_measures:
+            # If there's a big gap between the previous staff's last measure
+            # and this staff's first measure, the volta is in the gap
+            # (on staves our detector missed). Use curr_measures to infer.
+            prev_last = max(prev_measures)
+            curr_first = min(curr_measures)
+            if curr_first - prev_last > measures_per_staff * 1.5:
+                # Big gap — volta is for measures in the gap, not on prev staff
+                last_m = curr_first - 1
+                first_m = max(1, last_m - int(measures_per_staff) + 1)
+            else:
+                # Small gap — volta belongs to the end of previous staff
+                first_m = min(prev_measures)
+                last_m = max(prev_measures)
+        elif prev_measures:
+            first_m = min(prev_measures)
+            last_m = max(prev_measures)
+        elif curr_measures:
+            # Infer: the volta is for measures just before this staff's first measure
+            curr_first = min(curr_measures)
+            last_m = curr_first - 1
+            first_m = max(1, last_m - int(measures_per_staff) + 1)
+        else:
+            first_m = int(si * measures_per_staff) + 1
+            last_m = min(int((si + 1) * measures_per_staff), total_measures)
+
+        volta_groups.append({
+            "staff_index": si,
+            "volta_numbers": volta_numbers,
+            "first_measure": first_m,
+            "last_measure": last_m,
+        })
+
+    if not volta_groups:
+        return repeat_markers
+
+    # For each volta group, find matching repeat OR create new one.
+    # Match criterion: the repeat's end measure must be WITHIN this staff's
+    # measure range (based on real OCR-detected measure numbers).
+    result = list(repeat_markers)
+    used_repeats = set()
+
+    for vg in volta_groups:
+        best_match = None
+        for i, rm in enumerate(result):
+            if i in used_repeats:
+                continue
+            # The repeat's end must fall within this staff's measure range
+            if vg["first_measure"] <= rm["end_measure"] <= vg["last_measure"]:
+                best_match = i
+                break
+
+        if best_match is not None:
+            rm = result[best_match]
+            voltas = _build_volta_endings(
+                vg["volta_numbers"], rm["start_measure"], rm["end_measure"]
+            )
+            result[best_match] = dict(rm, volta_endings=voltas)
+            used_repeats.add(best_match)
+            print(f"[volta] Repeat m{rm['start_measure']}-m{rm['end_measure']}: "
+                  f"added volta endings {voltas}")
+        else:
+            # No matching repeat — create a new one
+            end = vg["last_measure"]
+            start = vg["first_measure"]
+            voltas = _build_volta_endings(vg["volta_numbers"], start, end)
+
+            new_rm = {
+                "start_measure": start,
+                "end_measure": end,
+                "repeat_count": 1,
+                "volta_endings": voltas,
+            }
+            result.append(new_rm)
+            print(f"[volta] Created NEW repeat m{start}-m{end} "
+                  f"with volta endings {voltas}")
+
+    return result
 
 
 def _find_staves(gray: np.ndarray, w: int, h: int) -> list[dict]:
@@ -76,7 +168,6 @@ def _find_staves(gray: np.ndarray, w: int, h: int) -> list[dict]:
     if len(staff_rows) == 0:
         return []
 
-    # Group consecutive rows into individual lines
     groups = []
     current = [staff_rows[0]]
     for i in range(1, len(staff_rows)):
@@ -87,7 +178,6 @@ def _find_staves(gray: np.ndarray, w: int, h: int) -> list[dict]:
             current = [staff_rows[i]]
     groups.append(int(np.mean(current)))
 
-    # Group lines into 5-line staves
     staves = []
     current_staff = [groups[0]]
     for i in range(1, len(groups)):
@@ -99,10 +189,8 @@ def _find_staves(gray: np.ndarray, w: int, h: int) -> list[dict]:
                 bottom = current_staff[-1]
                 spacing = (bottom - top) / max(1, len(current_staff) - 1)
                 staves.append({
-                    "top": top,
-                    "bottom": bottom,
-                    "spacing": spacing,
-                    "index": len(staves),
+                    "top": top, "bottom": bottom,
+                    "spacing": spacing, "index": len(staves),
                 })
             current_staff = [groups[i]]
     if len(current_staff) >= 4:
@@ -110,30 +198,35 @@ def _find_staves(gray: np.ndarray, w: int, h: int) -> list[dict]:
         bottom = current_staff[-1]
         spacing = (bottom - top) / max(1, len(current_staff) - 1)
         staves.append({
-            "top": top,
-            "bottom": bottom,
-            "spacing": spacing,
-            "index": len(staves),
+            "top": top, "bottom": bottom,
+            "spacing": spacing, "index": len(staves),
         })
 
     return staves
 
 
-def _find_volta_texts(img: np.ndarray, staves: list[dict]) -> list[dict]:
-    """Find "1", "2" (or "1.", "2.") text in the region above each staff."""
+def _find_volta_texts_and_measures(img: np.ndarray, staves: list[dict]) -> tuple[list[dict], dict[int, list[int]]]:
+    """
+    Find volta text ('1', '2') and measure numbers above each staff.
+    Returns (volta_texts, staff_measures) where staff_measures maps
+    staff_index → list of measure numbers found above that staff.
+    """
     try:
         from rapidocr_onnxruntime import RapidOCR
     except ImportError:
-        print("[volta] rapidocr not available, skipping volta detection")
-        return []
+        print("[volta] rapidocr not available")
+        return [], {}
 
     ocr = RapidOCR()
     volta_texts = []
-    h, w = img.shape[:2]
+    staff_measures: dict[int, list[int]] = {}
 
-    for staff in staves:
+    for i, staff in enumerate(staves):
         spacing = staff["spacing"]
-        zone_top = max(0, staff["top"] - int(spacing * 8))
+        if i > 0:
+            zone_top = staves[i - 1]["bottom"] + int(spacing * 2)
+        else:
+            zone_top = max(0, staff["top"] - int(spacing * 8))
         zone_bottom = staff["top"]
 
         if zone_bottom - zone_top < 10:
@@ -141,31 +234,22 @@ def _find_volta_texts(img: np.ndarray, staves: list[dict]) -> list[dict]:
 
         zone = img[zone_top:zone_bottom, :, :]
         result, _ = ocr(zone)
-
         if not result:
             continue
 
-        # Measure numbers vs volta numbers:
-        # - Volta numbers ("1", "2") sit HIGHER (closer to the bracket line, farther from staff)
-        # - Measure numbers sit LOWER (closer to the staff)
-        # Volta numbers are typically in the top 40% of the zone, measure numbers in the bottom 40%
         zone_height = zone_bottom - zone_top
-        # Volta numbers sit high above the staff (near the bracket line).
-        # Measure numbers sit low (right above the staff lines).
-        # The dividing line is roughly 60% down from the zone top.
         volta_y_max = zone_top + zone_height * 0.6
+
+        measures_on_staff = []
 
         for box, text, conf in result:
             text_clean = text.strip().rstrip(".,;:")
             box_y = int(min(p[1] for p in box)) + zone_top
             box_x = int(min(p[0] for p in box))
-            box_x_max = int(max(p[0] for p in box))
-            box_width = box_x_max - box_x
+            box_width = int(max(p[0] for p in box)) - box_x
 
-            # Must be a small number (1-3) in the upper portion of the zone
+            # Volta text: single digit 1-3, in upper portion, narrow
             if text_clean in ("1", "2", "3") and box_y < volta_y_max:
-                # Additional filter: volta numbers are small text (narrow width)
-                # Measure numbers like "14", "19" are wider
                 if box_width < spacing * 4:
                     volta_texts.append({
                         "number": int(text_clean),
@@ -175,85 +259,31 @@ def _find_volta_texts(img: np.ndarray, staves: list[dict]) -> list[dict]:
                         "confidence": conf,
                     })
 
-    return volta_texts
+            # Measure number: 2-3 digit number in lower portion (near staff)
+            elif text_clean.isdigit() and 2 <= len(text_clean) <= 3 and box_y >= volta_y_max:
+                num = int(text_clean)
+                if 1 <= num <= 200:  # reasonable measure range
+                    measures_on_staff.append(num)
+
+        if measures_on_staff:
+            staff_measures[staff["index"]] = sorted(measures_on_staff)
+
+    return volta_texts, staff_measures
 
 
-def _merge_voltas_into_repeats(
-    volta_texts: list[dict],
-    staves: list[dict],
-    repeat_markers: list[dict],
-) -> list[dict]:
-    """Map detected volta texts to repeat markers based on position."""
-    if not volta_texts or not repeat_markers:
-        return repeat_markers
+def _build_volta_endings(
+    volta_numbers: list[int],
+    start_measure: int,
+    end_measure: int,
+) -> dict[str, list[int]]:
+    """Build volta endings dict from detected volta numbers."""
+    num_voltas = len(volta_numbers)
+    measures_for_voltas = min(num_voltas, end_measure - start_measure + 1)
+    volta_start = end_measure - measures_for_voltas + 1
 
-    # Group volta texts by staff
-    by_staff = {}
-    for vt in volta_texts:
-        si = vt["staff_index"]
-        by_staff.setdefault(si, []).append(vt)
+    volta_endings = {}
+    for i, vnum in enumerate(volta_numbers):
+        measure = volta_start + i
+        volta_endings[str(measure)] = [vnum]
 
-    # For each staff with volta texts, sort by x position
-    for si in by_staff:
-        by_staff[si].sort(key=lambda v: v["x"])
-
-    # We need to figure out which staff index corresponds to which measures.
-    # Assumption: staves are in order, each staff contains roughly
-    # total_measures / num_staves measures.
-    # We map each repeat marker to the staff that contains its measures.
-    num_staves = len(staves)
-    if num_staves == 0:
-        return repeat_markers
-
-    # Estimate measures per staff from repeat marker data
-    all_measures = set()
-    for rm in repeat_markers:
-        for m in range(rm["start_measure"], rm["end_measure"] + 1):
-            all_measures.add(m)
-    total_measures = max(all_measures) if all_measures else 1
-    measures_per_staff = max(1, total_measures / num_staves)
-
-    updated = []
-    for rm in repeat_markers:
-        rm_copy = dict(rm)
-
-        # Which staff contains this repeat's end measure?
-        # (volta brackets appear at the end of the repeated section)
-        end_staff_idx = min(
-            int((rm["end_measure"] - 1) / measures_per_staff),
-            num_staves - 1
-        )
-
-        # Check if this staff has volta texts
-        staff_voltas = by_staff.get(end_staff_idx, [])
-        if not staff_voltas:
-            # Also check the staff before (volta might span the barline)
-            staff_voltas = by_staff.get(end_staff_idx - 1, [])
-
-        if staff_voltas:
-            # Build volta endings map
-            # Sort by volta number, assign to measures near the end of the repeat
-            volta_numbers = sorted(set(v["number"] for v in staff_voltas))
-            if len(volta_numbers) >= 2:
-                # We have at least a 1st and 2nd ending
-                # Assign them to the last N measures of the repeat range
-                end = rm["end_measure"]
-                start = rm["start_measure"]
-                num_voltas = len(volta_numbers)
-
-                # Each volta gets roughly equal measures at the end
-                # Simple heuristic: 2 endings, last 2 measures
-                measures_for_voltas = min(num_voltas, end - start + 1)
-                volta_start = end - measures_for_voltas + 1
-
-                volta_endings = {}
-                for i, vnum in enumerate(volta_numbers):
-                    measure = volta_start + i
-                    volta_endings[str(measure)] = [vnum]
-
-                rm_copy["volta_endings"] = volta_endings
-                print(f"[volta] Repeat m{start}-m{end}: added volta endings {volta_endings}")
-
-        updated.append(rm_copy)
-
-    return updated
+    return volta_endings
