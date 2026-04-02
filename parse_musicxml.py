@@ -51,11 +51,10 @@ def duration_type_name(type_text: str, dots: int = 0) -> str:
         "eighth": "eighth",
         "16th": "sixteenth",
         "32nd": "thirtySecond",
-        "64th": "sixtyFourth",
     }
     name = base_map.get(type_text, type_text)
-    if dots == 1:
-        name = "dotted" + name[0].upper() + name[1:]
+    if dots >= 1:
+        name = "dotted-" + name
     return name
 
 
@@ -372,21 +371,36 @@ def parse_musicxml_to_json(
                         # Check for grace note
                         is_grace = find(note_el, "grace") is not None
 
-                        note_entry = {
-                            "pitch": midi,
-                            "pitch_name": p_name,
-                            "start_time": round(current_time, 4),
-                            "end_time": round(current_time + dur_seconds, 4),
-                            "duration": round(dur_seconds, 4),
-                            "duration_type": duration_type_name(type_text, dots),
-                            "beat": round(current_beat, 4),
-                            "measure": measure_number,
-                            "confidence": 0.9,
-                        }
+                        # Grace notes get near-zero duration so they don't
+                        # overlap the principal note in the playback schedule
+                        if is_grace:
+                            grace_dur = 0.05
+                            note_entry = {
+                                "pitch": midi,
+                                "pitch_name": p_name,
+                                "start_time": round(current_time, 4),
+                                "end_time": round(current_time + grace_dur, 4),
+                                "duration": grace_dur,
+                                "duration_type": duration_type_name(type_text, dots),
+                                "beat": round(current_beat, 4),
+                                "measure": measure_number,
+                                "confidence": 0.9,
+                                "is_grace": True,
+                            }
+                        else:
+                            note_entry = {
+                                "pitch": midi,
+                                "pitch_name": p_name,
+                                "start_time": round(current_time, 4),
+                                "end_time": round(current_time + dur_seconds, 4),
+                                "duration": round(dur_seconds, 4),
+                                "duration_type": duration_type_name(type_text, dots),
+                                "beat": round(current_beat, 4),
+                                "measure": measure_number,
+                                "confidence": 0.9,
+                            }
                         if arts:
                             note_entry["articulations"] = arts
-                        if is_grace:
-                            note_entry["is_grace"] = True
 
                         notes_out.append(note_entry)
 

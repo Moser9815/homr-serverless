@@ -13,3 +13,4 @@ runpod>=1.7.0
 
 # Image handling
 Pillow>=10.0.0
+pillow-heif>=0.10.0

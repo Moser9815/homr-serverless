@@ -15,8 +15,14 @@ import tempfile
 import time
 import traceback
 
-from PIL import Image
+from PIL import Image, ImageOps
 import io
+
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass  # HEIC support optional
 
 import runpod
 
@@ -28,25 +34,11 @@ def decode_image(base64_data: str) -> Image.Image:
     image_bytes = base64.b64decode(base64_data)
     img = Image.open(io.BytesIO(image_bytes))
 
-    # Apply EXIF orientation
-    try:
-        from PIL import ExifTags
-        exif = img._getexif()
-        if exif:
-            for tag, value in exif.items():
-                if ExifTags.TAGS.get(tag) == "Orientation":
-                    if value == 3:
-                        img = img.rotate(180, expand=True)
-                    elif value == 6:
-                        img = img.rotate(270, expand=True)
-                    elif value == 8:
-                        img = img.rotate(90, expand=True)
-                    break
-    except (AttributeError, KeyError):
-        pass
+    # Apply EXIF orientation (handles all 8 orientations)
+    img = ImageOps.exif_transpose(img)
 
     # Convert to RGB if needed
-    if img.mode in ("RGBA", "P", "LA"):
+    if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
 
     return img
