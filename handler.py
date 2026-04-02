@@ -89,7 +89,6 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
 
     # Step 4: Extract staff pixel data, scaled to original image coordinates
     # HOMR resizes the image before processing — need to scale back
-    from homr.resize import resize_image
     import cv2 as _cv2
     original = _cv2.imread(image_path)
     orig_h, orig_w = original.shape[:2]
@@ -168,15 +167,7 @@ def handler(event):
 
         try:
             # Run HOMR via Python API (returns staff/barline data)
-            # Check if CUDA is actually available before requesting GPU
-            try:
-                import onnxruntime as _ort
-                providers = _ort.get_available_providers()
-                use_gpu = "CUDAExecutionProvider" in providers
-                print(f"[HOMR] ONNX providers: {providers}, use_gpu={use_gpu}")
-            except Exception:
-                use_gpu = False
-            musicxml_path, staff_info, barline_info = run_homr_api(tmp_path, use_gpu)
+            musicxml_path, staff_info, barline_info = run_homr_api(tmp_path, use_gpu=True)
 
             with open(musicxml_path, "r", encoding="utf-8") as f:
                 musicxml_content = f.read()
