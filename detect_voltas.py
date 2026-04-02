@@ -16,9 +16,15 @@ def detect_voltas(
     image_path: str,
     repeat_markers: list[dict],
     total_measures: int = 0,
+    staff_info: list[dict] | None = None,
+    barline_info: list[dict] | None = None,
 ) -> list[dict]:
     """
     Detect volta brackets and merge with HOMR's repeat markers.
+
+    If staff_info/barline_info are provided (from HOMR's Python API),
+    uses those for accurate staff positions. Otherwise falls back to
+    OpenCV-based staff detection.
     """
     img = cv2.imread(image_path)
     if img is None:
@@ -28,12 +34,23 @@ def detect_voltas(
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
-    staves = _find_staves(gray, w, h)
-    if not staves:
-        print("[volta] No staves found")
-        return repeat_markers
-
-    print(f"[volta] Found {len(staves)} staves")
+    # Use HOMR's staff data if available, otherwise fall back to OpenCV
+    if staff_info:
+        staves = []
+        for si, s in enumerate(staff_info):
+            staves.append({
+                "top": int(s["min_y"]),
+                "bottom": int(s["max_y"]),
+                "spacing": s["unit_size"],
+                "index": si,
+            })
+        print(f"[volta] Using {len(staves)} staves from HOMR API")
+    else:
+        staves = _find_staves(gray, w, h)
+        if not staves:
+            print("[volta] No staves found")
+            return repeat_markers
+        print(f"[volta] Found {len(staves)} staves via OpenCV")
 
     volta_texts, staff_measures = _find_volta_texts_and_measures(img, staves)
     if not volta_texts:
@@ -48,10 +65,26 @@ def detect_voltas(
         all_m = [rm["end_measure"] for rm in repeat_markers] if repeat_markers else [1]
         total_measures = max(all_m)
 
-    # Group volta texts by staff
+    # Group volta texts by staff, then merge adjacent staves that together
+    # form a volta pair (e.g., "1" on staff N and "2" on staff N+1)
     by_staff: dict[int, list[dict]] = {}
     for vt in volta_texts:
         by_staff.setdefault(vt["staff_index"], []).append(vt)
+
+    # Merge adjacent staves: if staff N has only "1" or "2" and staff N+1
+    # has only the other, combine them under the higher staff index
+    staff_indices = sorted(by_staff.keys())
+    for i in range(len(staff_indices) - 1):
+        si_a = staff_indices[i]
+        si_b = staff_indices[i + 1]
+        if si_b - si_a == 1:  # Adjacent staves
+            nums_a = set(v["number"] for v in by_staff[si_a])
+            nums_b = set(v["number"] for v in by_staff[si_b])
+            # If together they form a complete pair but individually they don't
+            if len(nums_a) < 2 and len(nums_b) < 2 and len(nums_a | nums_b) >= 2:
+                # Merge into the higher staff (where the music continues)
+                by_staff[si_b] = by_staff.get(si_b, []) + by_staff.pop(si_a, [])
+                print(f"[volta] Merged volta texts from staff {si_a} into staff {si_b}")
 
     # For each staff with a volta pair, determine the measure range
     # using OCR-detected measure numbers (not estimation)
@@ -249,10 +282,19 @@ def _find_volta_texts_and_measures(img: np.ndarray, staves: list[dict]) -> tuple
             box_width = int(max(p[0] for p in box)) - box_x
 
             # Volta text: single digit 1-3, in upper portion, narrow
-            if text_clean in ("1", "2", "3") and box_y < volta_y_max:
+            # OCR sometimes reads "1" as "I" (capital i) or "l" (lowercase L)
+            volta_number = None
+            if text_clean in ("1", "I", "l") and box_y < volta_y_max:
+                volta_number = 1
+            elif text_clean in ("2",) and box_y < volta_y_max:
+                volta_number = 2
+            elif text_clean in ("3",) and box_y < volta_y_max:
+                volta_number = 3
+
+            if volta_number is not None:
                 if box_width < spacing * 4:
                     volta_texts.append({
-                        "number": int(text_clean),
+                        "number": volta_number,
                         "x": box_x,
                         "y": box_y,
                         "staff_index": staff["index"],
