@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.venv/
+*.egg-info/
+dist/
+
+# Test outputs
+*_homr_result.json
+*_homr.musicxml
+*.png
+*.jpg
+*.jpeg
+*.HEIC
+*.heic
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Environment
+.env
+.env.local
+
+# Docker
+*.log
