@@ -207,6 +207,10 @@ def handler(event):
             metadata["staves_detected"] = len(staff_info)
             metadata["barlines_detected"] = len(barline_info)
 
+            # Include volta debug info
+            from detect_voltas import _volta_debug
+            metadata["volta_debug"] = _volta_debug
+
             return {
                 "success": True,
                 "notes": notes,
