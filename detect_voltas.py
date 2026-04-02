@@ -127,19 +127,23 @@ def _find_volta_brackets(
                     "staff_below": i,
                 })
 
-        if not brackets:
-            continue
+        if len(brackets) < 2:
+            continue  # Need at least 2 brackets for a 1st/2nd ending pair
 
-        # For each bracket, look for "1" or "2" near its left end
+        # Sort brackets by x position (left to right)
+        brackets.sort(key=lambda b: b["x"])
+
+        # Strategy: try OCR on each bracket to identify "1" or "2".
+        # If we find a "2", the bracket to its LEFT is automatically "1"
+        # (no OCR needed — the existence of "2" implies "1").
         try:
             from rapidocr_onnxruntime import RapidOCR
             ocr = RapidOCR()
         except ImportError:
             continue
 
-        for bracket in brackets:
-            # Crop a small area near the left end of the bracket
-            # The number sits just below and slightly right of the bracket's left edge
+        identified = {}  # bracket_index → volta_number
+        for bi, bracket in enumerate(brackets):
             left_x = max(0, bracket["x"] - int(spacing))
             right_x = min(img_width, bracket["x"] + int(spacing * 5))
             top_y = bracket["y"]
@@ -151,27 +155,34 @@ def _find_volta_brackets(
             crop = img[top_y:bot_y, left_x:right_x, :]
             result, _ = ocr(crop)
 
-            if not result:
-                continue
+            if result:
+                for box, text, conf in result:
+                    tc = text.strip().rstrip(".,;:")
+                    if tc in ("1", "I", "l"):
+                        identified[bi] = 1
+                    elif tc == "2":
+                        identified[bi] = 2
+                    elif tc == "3":
+                        identified[bi] = 3
 
-            volta_number = None
-            for box, text, conf in result:
-                tc = text.strip().rstrip(".,;:")
-                if tc in ("1", "I", "l"):
-                    volta_number = 1
-                elif tc == "2":
-                    volta_number = 2
-                elif tc == "3":
-                    volta_number = 3
+        # If we found a "2", infer "1" for the bracket immediately to its left
+        for bi, num in list(identified.items()):
+            if num == 2 and bi > 0 and (bi - 1) not in identified:
+                identified[bi - 1] = 1
+                print(f"[volta] Inferred '1' bracket from '2' at staff gap above staff {i}")
+            elif num == 3 and bi > 0 and (bi - 1) not in identified:
+                identified[bi - 1] = 2
+                if bi > 1 and (bi - 2) not in identified:
+                    identified[bi - 2] = 1
 
-            if volta_number is not None:
-                volta_pairs.append({
-                    "number": volta_number,
-                    "bracket_x": bracket["x"],
-                    "bracket_y": bracket["y"],
-                    "bracket_width": bracket["width"],
-                    "staff_below": bracket["staff_below"],
-                })
+        for bi, num in identified.items():
+            volta_pairs.append({
+                "number": num,
+                "bracket_x": brackets[bi]["x"],
+                "bracket_y": brackets[bi]["y"],
+                "bracket_width": brackets[bi]["width"],
+                "staff_below": brackets[bi]["staff_below"],
+            })
 
     return volta_pairs
 
