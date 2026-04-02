@@ -21,8 +21,8 @@ WORKDIR /app
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir -r requirements.txt
 
 # Pre-download HOMR models during build (avoids cold-start download)
 RUN python3 -c "from homr.main import download_weights; download_weights(use_gpu_inference=True)"
