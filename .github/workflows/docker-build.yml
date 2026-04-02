@@ -41,7 +41,5 @@ jobs:
           context: .
           push: true
           tags: moser9815/homr-serverless:latest
-          cache-from: type=registry,ref=moser9815/homr-serverless:buildcache
-          cache-to: type=registry,ref=moser9815/homr-serverless:buildcache,mode=max
           provenance: false
           sbom: false
