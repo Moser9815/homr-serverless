@@ -24,14 +24,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Pre-download HOMR models during build (avoids cold-start latency)
-# Force model download by running on a tiny test image
-RUN python -c "\
-from PIL import Image; \
-img = Image.new('RGB', (100, 50), 'white'); \
-img.save('/tmp/test_init.png')" && \
-    homr --gpu no /tmp/test_init.png 2>/dev/null || true && \
-    rm -f /tmp/test_init.png /tmp/test_init.musicxml /tmp/test_init.xml
+# Pre-download HOMR models during build (avoids cold-start download)
+RUN python -c "from homr.main import download_weights; download_weights(use_gpu_inference=True)"
 
 # Copy handler code
 COPY handler.py .
