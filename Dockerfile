@@ -36,5 +36,6 @@ img.save('/tmp/test_init.png')" && \
 # Copy handler code
 COPY handler.py .
 COPY parse_musicxml.py .
+COPY detect_voltas.py .
 
 CMD ["python", "-u", "handler.py"]
