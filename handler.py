@@ -135,11 +135,17 @@ def handler(event):
 
             # Post-process: detect volta brackets HOMR missed
             repeat_markers = parsed.get("repeat_markers", [])
+            volta_status = "skipped"
             if repeat_markers:
                 try:
                     repeat_markers = detect_voltas(tmp_path, repeat_markers)
+                    has_voltas = any(rm.get("volta_endings") for rm in repeat_markers)
+                    volta_status = "detected" if has_voltas else "none_found"
                 except Exception as e:
+                    volta_status = f"error: {e}"
                     print(f"[volta] Detection failed (non-fatal): {e}")
+                    import traceback
+                    traceback.print_exc()
 
             # Build response
             notes = parsed.get("notes", [])
@@ -147,6 +153,7 @@ def handler(event):
             metadata = parsed.get("metadata", {})
             metadata["processing_time"] = round(processing_time, 2)
             metadata["detection_method"] = "homr"
+            metadata["volta_detection"] = volta_status
 
             return {
                 "success": True,
