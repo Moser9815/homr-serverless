@@ -127,8 +127,8 @@ def _find_volta_brackets(
                     "staff_below": i,
                 })
 
-        if len(brackets) < 2:
-            continue  # Need at least 2 brackets for a 1st/2nd ending pair
+        if not brackets:
+            continue
 
         # Sort brackets by x position (left to right)
         brackets.sort(key=lambda b: b["x"])
@@ -165,11 +165,25 @@ def _find_volta_brackets(
                     elif tc == "3":
                         identified[bi] = 3
 
-        # If we found a "2", infer "1" for the bracket immediately to its left
+        # If we found a "2", infer "1" for the bracket immediately to its left.
+        # If there IS no bracket to the left (only 1 bracket found), create
+        # a synthetic "1" entry — we know it exists even if the line wasn't detected.
         for bi, num in list(identified.items()):
             if num == 2 and bi > 0 and (bi - 1) not in identified:
                 identified[bi - 1] = 1
                 print(f"[volta] Inferred '1' bracket from '2' at staff gap above staff {i}")
+            elif num == 2 and bi == 0 and len(brackets) == 1:
+                # Only one bracket found and it's "2" — create synthetic "1"
+                synthetic_bracket = {
+                    "x": max(0, brackets[0]["x"] - brackets[0]["width"]),
+                    "y": brackets[0]["y"],
+                    "width": brackets[0]["width"],
+                    "staff_below": brackets[0]["staff_below"],
+                }
+                brackets.insert(0, synthetic_bracket)
+                # Now brackets[0]=synthetic "1", brackets[1]=original "2"
+                identified = {0: 1, 1: 2}
+                print(f"[volta] Inferred '1' (synthetic bracket) from '2' at staff gap above staff {i}")
             elif num == 3 and bi > 0 and (bi - 1) not in identified:
                 identified[bi - 1] = 2
                 if bi > 1 and (bi - 2) not in identified:
