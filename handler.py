@@ -140,9 +140,10 @@ def handler(event):
 
             processing_time = time.time() - start_time
 
-            # Build response in same format as oemer endpoint
+            # Build response
             notes = parsed.get("notes", [])
             rests = parsed.get("rests", [])
+            repeat_markers = parsed.get("repeat_markers", [])
             metadata = parsed.get("metadata", {})
             metadata["processing_time"] = round(processing_time, 2)
             metadata["detection_method"] = "homr"
@@ -151,11 +152,13 @@ def handler(event):
                 "success": True,
                 "notes": notes,
                 "rests": rests,
+                "repeat_markers": repeat_markers,
                 "note_count": len(notes),
                 "rest_count": len(rests),
+                "repeat_count": len(repeat_markers),
                 "metadata": metadata,
                 "musicxml": musicxml_content,
-                "message": f"HOMR processed {len(notes)} notes and {len(rests)} rests in {processing_time:.1f}s",
+                "message": f"HOMR processed {len(notes)} notes, {len(rests)} rests, {len(repeat_markers)} repeats in {processing_time:.1f}s",
             }
 
         finally:

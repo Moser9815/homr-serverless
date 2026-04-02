@@ -1,8 +1,10 @@
 """
 MusicXML Parser — Converts HOMR's MusicXML output to structured note/rest JSON.
 
-Produces the same format as the oemer endpoint so the iOS app can use either
-backend with zero changes.
+Extracts notes, rests, repeat markers, volta brackets, articulations, and
+other musical elements that HOMR's transformer can detect.
+
+Produces a format compatible with the Music Learning App's iOS models.
 
 This code is licensed under AGPL-3.0 to comply with HOMR's license.
 """
@@ -10,8 +12,7 @@ This code is licensed under AGPL-3.0 to comply with HOMR's license.
 import xml.etree.ElementTree as ET
 from typing import Any
 
-# MusicXML duration type mapping (divisions-relative → named duration)
-# Standard MusicXML type names
+# MusicXML duration type mapping
 MUSICXML_TYPE_TO_DURATION = {
     "whole": 4.0,
     "half": 2.0,
@@ -22,14 +23,12 @@ MUSICXML_TYPE_TO_DURATION = {
     "64th": 0.0625,
 }
 
-# Pitch name mapping
 STEP_TO_PITCH_CLASS = {
     "C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11,
 }
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
-# Key signature: fifths value → key name
 FIFTHS_TO_KEY = {
     -7: "Cb", -6: "Gb", -5: "Db", -4: "Ab", -3: "Eb", -2: "Bb", -1: "F",
     0: "C", 1: "G", 2: "D", 3: "A", 4: "E", 5: "B", 6: "F#", 7: "C#",
@@ -37,19 +36,14 @@ FIFTHS_TO_KEY = {
 
 
 def midi_pitch(step: str, octave: int, alter: int = 0) -> int:
-    """Convert MusicXML pitch (step, octave, alter) to MIDI number."""
     return (octave + 1) * 12 + STEP_TO_PITCH_CLASS[step] + alter
 
 
 def pitch_name_from_midi(midi: int) -> str:
-    """Convert MIDI number to human-readable pitch name (e.g., 'C4', 'F#3')."""
-    note = NOTE_NAMES[midi % 12]
-    octave = (midi // 12) - 1
-    return f"{note}{octave}"
+    return f"{NOTE_NAMES[midi % 12]}{(midi // 12) - 1}"
 
 
 def duration_type_name(type_text: str, dots: int = 0) -> str:
-    """Convert MusicXML type text + dots to our duration type name."""
     base_map = {
         "whole": "whole",
         "half": "half",
@@ -66,13 +60,156 @@ def duration_type_name(type_text: str, dots: int = 0) -> str:
 
 
 def duration_beats(type_text: str, dots: int = 0) -> float:
-    """Calculate duration in beats from MusicXML type + dots."""
     base = MUSICXML_TYPE_TO_DURATION.get(type_text, 1.0)
     if dots == 1:
         base *= 1.5
     elif dots == 2:
         base *= 1.75
     return base
+
+
+def _extract_articulations(note_el, ns: str) -> list[str]:
+    """Extract articulation names from a note element's notations."""
+    articulations = []
+
+    def find(el, tag):
+        return el.find(f"{ns}{tag}")
+
+    def findall(el, tag):
+        return el.findall(f"{ns}{tag}")
+
+    notations = find(note_el, "notations")
+    if notations is None:
+        return articulations
+
+    # Direct children of notations
+    fermata = find(notations, "fermata")
+    if fermata is not None:
+        articulations.append("fermata")
+
+    arpeggiate = find(notations, "arpeggiate")
+    if arpeggiate is not None:
+        articulations.append("arpeggiate")
+
+    # Articulations container
+    arts_el = find(notations, "articulations")
+    if arts_el is not None:
+        for child in arts_el:
+            tag = child.tag
+            if "}" in tag:
+                tag = tag.split("}")[-1]
+            articulations.append(tag)
+
+    # Ornaments container
+    ornaments = find(notations, "ornaments")
+    if ornaments is not None:
+        for child in ornaments:
+            tag = child.tag
+            if "}" in tag:
+                tag = tag.split("}")[-1]
+            articulations.append(tag)
+
+    return articulations
+
+
+def _extract_repeats_and_voltas(measures, ns: str) -> list[dict]:
+    """
+    Extract repeat markers and volta brackets from barline elements.
+
+    MusicXML encodes repeats as:
+    - <barline><repeat direction="forward"/></barline> = start of repeat
+    - <barline><repeat direction="backward"/></barline> = end of repeat
+    - <barline><ending number="1" type="start"/></barline> = volta start
+    - <barline><ending number="1" type="stop"/></barline> = volta end
+
+    Returns list matching the iOS RepeatMarker format:
+    [{
+        "start_measure": int,
+        "end_measure": int,
+        "repeat_count": 1,
+        "volta_endings": {"5": [1], "6": [2]} or null
+    }]
+    """
+    def find(el, tag):
+        return el.find(f"{ns}{tag}")
+
+    def findall(el, tag):
+        return el.findall(f"{ns}{tag}")
+
+    # Collect all repeat barlines
+    forward_starts = []  # Measures with forward repeat
+    backward_ends = []   # Measures with backward repeat
+
+    # Collect volta/ending info
+    volta_info = []  # (measure_number, ending_number, type)
+
+    for measure in measures:
+        measure_num = int(measure.get("number", "1"))
+
+        for barline in findall(measure, "barline"):
+            repeat = find(barline, "repeat")
+            ending = find(barline, "ending")
+
+            if repeat is not None:
+                direction = repeat.get("direction", "")
+                if direction == "forward":
+                    forward_starts.append(measure_num)
+                elif direction == "backward":
+                    backward_ends.append(measure_num)
+
+            if ending is not None:
+                ending_num = ending.get("number", "1")
+                ending_type = ending.get("type", "")
+                volta_info.append((measure_num, ending_num, ending_type))
+
+    # Pair forward/backward into repeat markers
+    repeat_markers = []
+
+    # Sort for pairing
+    forward_starts.sort()
+    backward_ends.sort()
+
+    for end_measure in backward_ends:
+        # Find the most recent forward start before this end
+        start_measure = 1  # Default: repeat from measure 1
+        for fs in reversed(forward_starts):
+            if fs <= end_measure:
+                start_measure = fs
+                break
+
+        # Remove used forward start
+        if start_measure in forward_starts:
+            forward_starts.remove(start_measure)
+
+        # Check for volta endings within this repeat range
+        volta_endings = None
+        voltas_in_range = [
+            (m, num, typ) for m, num, typ in volta_info
+            if start_measure <= m <= end_measure and typ == "start"
+        ]
+
+        if voltas_in_range:
+            # Build volta map: measure -> [iterations]
+            volta_endings = {}
+            for m, num, _ in voltas_in_range:
+                try:
+                    iterations = [int(n) for n in num.split(",")]
+                except ValueError:
+                    iterations = [int(num)]
+                volta_endings[str(m)] = iterations
+
+        repeat_markers.append({
+            "start_measure": start_measure,
+            "end_measure": end_measure,
+            "repeat_count": 1,
+            "volta_endings": volta_endings,
+        })
+
+    # Handle any remaining forward starts without a backward end
+    # (open-ended repeats — less common but valid)
+    # We skip these since they can't form a complete repeat marker
+
+    return repeat_markers
 
 
 def parse_musicxml_to_json(
@@ -82,21 +219,18 @@ def parse_musicxml_to_json(
     default_time_signature: str = "4/4",
 ) -> dict[str, Any]:
     """
-    Parse MusicXML content into structured note/rest JSON.
+    Parse MusicXML content into structured JSON.
 
-    Returns the same format as the oemer endpoint:
+    Returns:
     {
         "notes": [...],
         "rests": [...],
-        "metadata": {
-            "tempo", "time_signature", "clef", "detected_key",
-            "total_measures", ...
-        }
+        "repeat_markers": [...],
+        "metadata": { ... }
     }
     """
     root = ET.fromstring(musicxml_content)
 
-    # MusicXML namespace handling — some files use a namespace, some don't
     ns = ""
     if root.tag.startswith("{"):
         ns = root.tag.split("}")[0] + "}"
@@ -111,16 +245,15 @@ def parse_musicxml_to_json(
         el = find(element, tag)
         return el.text if el is not None and el.text else default
 
-    # Extract parts
     parts = findall(root, "part")
     if not parts:
-        # Try score-partwise > part
         score = find(root, "score-partwise")
         if score is not None:
             parts = findall(score, "part")
 
     notes_out = []
     rests_out = []
+    repeat_markers = []
 
     detected_tempo = default_tempo
     detected_time_sig = default_time_signature
@@ -130,30 +263,34 @@ def parse_musicxml_to_json(
     time_sig_detected = False
     total_measures = 0
 
-    # Parse time signature components
     ts_parts = default_time_signature.split("/")
     beats_per_measure = int(ts_parts[0])
     beat_unit = int(ts_parts[1])
 
+    # Track articulation counts for metadata
+    articulation_counts = {}
+
     for part in parts:
         measures = findall(part, "measure")
-        current_time = 0.0  # Running time in seconds
-        current_beat = 1.0  # Current beat within measure
-        divisions = 1  # MusicXML divisions per quarter note
+
+        # Extract repeats and voltas from barlines
+        repeat_markers = _extract_repeats_and_voltas(measures, ns)
+
+        current_time = 0.0
+        current_beat = 1.0
+        divisions = 1
 
         for measure in measures:
             measure_number = int(measure.get("number", "1"))
             total_measures = max(total_measures, measure_number)
             current_beat = 1.0
 
-            # Check for attributes (time signature, key, clef, divisions)
             attributes = find(measure, "attributes")
             if attributes is not None:
                 div_el = find(attributes, "divisions")
                 if div_el is not None and div_el.text:
                     divisions = int(div_el.text)
 
-                # Time signature
                 time_el = find(attributes, "time")
                 if time_el is not None:
                     beat_text = find_text(time_el, "beats")
@@ -164,7 +301,6 @@ def parse_musicxml_to_json(
                         detected_time_sig = f"{beats_per_measure}/{beat_unit}"
                         time_sig_detected = True
 
-                # Key signature
                 key_el = find(attributes, "key")
                 if key_el is not None:
                     fifths_text = find_text(key_el, "fifths")
@@ -172,11 +308,9 @@ def parse_musicxml_to_json(
                         fifths = int(fifths_text)
                         detected_key = FIFTHS_TO_KEY.get(fifths, "C")
 
-                # Clef
                 clef_el = find(attributes, "clef")
                 if clef_el is not None:
                     sign = find_text(clef_el, "sign", "G")
-                    line = find_text(clef_el, "line", "2")
                     if sign == "G":
                         detected_clef = "treble"
                     elif sign == "F":
@@ -184,37 +318,30 @@ def parse_musicxml_to_json(
                     elif sign == "C":
                         detected_clef = "alto"
 
-            # Check for tempo (direction > sound)
             for direction in findall(measure, "direction"):
                 sound = find(direction, "sound")
                 if sound is not None and sound.get("tempo"):
                     detected_tempo = int(float(sound.get("tempo")))
                     tempo_detected = True
 
-            # Calculate seconds per beat based on current tempo
             seconds_per_beat = 60.0 / detected_tempo
 
-            # Process notes and rests
             for note_el in findall(measure, "note"):
-                # Check for chord (simultaneous notes) — don't advance time
                 is_chord = find(note_el, "chord") is not None
 
-                # Get duration in divisions
-                dur_div_el = find(note_el, "duration")
-                dur_divisions = int(dur_div_el.text) if dur_div_el is not None and dur_div_el.text else divisions
-
-                # Get note type (quarter, eighth, etc.)
                 type_el = find(note_el, "type")
                 type_text = type_el.text if type_el is not None and type_el.text else "quarter"
 
-                # Count dots
                 dots = len(findall(note_el, "dot"))
 
-                # Duration in beats
                 dur_beats = duration_beats(type_text, dots)
                 dur_seconds = dur_beats * seconds_per_beat
 
-                # Check if rest
+                # Extract articulations
+                arts = _extract_articulations(note_el, ns)
+                for a in arts:
+                    articulation_counts[a] = articulation_counts.get(a, 0) + 1
+
                 is_rest = find(note_el, "rest") is not None
 
                 if is_rest:
@@ -227,9 +354,11 @@ def parse_musicxml_to_json(
                         "end_time": round(current_time + dur_seconds, 4),
                         "duration": round(dur_seconds, 4),
                     }
+                    # Include articulations on rests too (e.g., fermata on rest)
+                    if arts:
+                        rest_entry["articulations"] = arts
                     rests_out.append(rest_entry)
                 else:
-                    # Extract pitch
                     pitch_el = find(note_el, "pitch")
                     if pitch_el is not None:
                         step = find_text(pitch_el, "step", "C")
@@ -239,6 +368,9 @@ def parse_musicxml_to_json(
 
                         midi = midi_pitch(step, octave, alter)
                         p_name = pitch_name_from_midi(midi)
+
+                        # Check for grace note
+                        is_grace = find(note_el, "grace") is not None
 
                         note_entry = {
                             "pitch": midi,
@@ -251,14 +383,19 @@ def parse_musicxml_to_json(
                             "measure": measure_number,
                             "confidence": 0.9,
                         }
+                        if arts:
+                            note_entry["articulations"] = arts
+                        if is_grace:
+                            note_entry["is_grace"] = True
+
                         notes_out.append(note_entry)
 
-                # Advance time (unless chord)
                 if not is_chord:
-                    current_time += dur_seconds
-                    current_beat += dur_beats
+                    # Grace notes don't advance time
+                    if find(note_el, "grace") is None:
+                        current_time += dur_seconds
+                        current_beat += dur_beats
 
-            # Handle forward/backup elements (voice changes, etc.)
             for forward in findall(measure, "forward"):
                 dur_el = find(forward, "duration")
                 if dur_el is not None and dur_el.text:
@@ -273,10 +410,9 @@ def parse_musicxml_to_json(
                     current_time -= bk_beats * seconds_per_beat
                     current_beat -= bk_beats
 
-        # Only process first part for now (single-staff sheets)
+        # Only process first part
         break
 
-    # Build key display name
     key_display = detected_key
     if detected_key in FIFTHS_TO_KEY.values():
         key_display = f"{detected_key} major"
@@ -284,6 +420,7 @@ def parse_musicxml_to_json(
     return {
         "notes": notes_out,
         "rests": rests_out,
+        "repeat_markers": repeat_markers,
         "metadata": {
             "tempo": detected_tempo,
             "tempo_detected": tempo_detected,
@@ -293,5 +430,6 @@ def parse_musicxml_to_json(
             "detected_key": detected_key,
             "key_display": key_display,
             "total_measures": total_measures,
+            "articulations_detected": articulation_counts if articulation_counts else None,
         },
     }
