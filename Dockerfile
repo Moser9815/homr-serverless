@@ -4,7 +4,7 @@
 # Lightweight build: python-slim + onnxruntime-gpu (bundles its own CUDA libs).
 # No full CUDA base image needed since HOMR is ONNX-only.
 
-FROM python:3.11-slim
+FROM runpod/base:0.6.2-cuda12.2.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
