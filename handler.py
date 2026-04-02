@@ -168,7 +168,14 @@ def handler(event):
 
         try:
             # Run HOMR via Python API (returns staff/barline data)
-            use_gpu = os.environ.get("HOMR_GPU", "auto") != "no"
+            # Check if CUDA is actually available before requesting GPU
+            try:
+                import onnxruntime as _ort
+                providers = _ort.get_available_providers()
+                use_gpu = "CUDAExecutionProvider" in providers
+                print(f"[HOMR] ONNX providers: {providers}, use_gpu={use_gpu}")
+            except Exception:
+                use_gpu = False
             musicxml_path, staff_info, barline_info = run_homr_api(tmp_path, use_gpu)
 
             with open(musicxml_path, "r", encoding="utf-8") as f:
