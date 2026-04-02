@@ -71,20 +71,34 @@ def detect_voltas(
     for vt in volta_texts:
         by_staff.setdefault(vt["staff_index"], []).append(vt)
 
-    # Merge adjacent staves: if staff N has only "1" or "2" and staff N+1
-    # has only the other, combine them under the higher staff index
+    # Merge adjacent staves: if staff N has some volta numbers and staff N+1
+    # has complementary ones, combine them — but ONLY if the Y positions are
+    # close (within 50px), since real volta pairs sit on the same bracket line.
     staff_indices = sorted(by_staff.keys())
     for i in range(len(staff_indices) - 1):
         si_a = staff_indices[i]
         si_b = staff_indices[i + 1]
-        if si_b - si_a == 1:  # Adjacent staves
+        if si_b - si_a == 1:
             nums_a = set(v["number"] for v in by_staff[si_a])
             nums_b = set(v["number"] for v in by_staff[si_b])
-            # If together they form a complete pair but individually they don't
             if len(nums_a) < 2 and len(nums_b) < 2 and len(nums_a | nums_b) >= 2:
-                # Merge into the higher staff (where the music continues)
-                by_staff[si_b] = by_staff.get(si_b, []) + by_staff.pop(si_a, [])
-                print(f"[volta] Merged volta texts from staff {si_a} into staff {si_b}")
+                # Check Y proximity: real volta pairs are at similar Y
+                ys_a = [v["y"] for v in by_staff[si_a]]
+                ys_b = [v["y"] for v in by_staff[si_b]]
+                y_gap = abs(min(ys_a) - min(ys_b)) if ys_a and ys_b else 999
+                if y_gap < 50:
+                    by_staff[si_b] = by_staff.get(si_b, []) + by_staff.pop(si_a, [])
+                    print(f"[volta] Merged volta texts from staff {si_a} into staff {si_b}")
+                else:
+                    print(f"[volta] Skipped merge staff {si_a}→{si_b}: Y gap {y_gap}px too large")
+
+    # Also filter out isolated single-number groups (likely false positives)
+    # A real volta always has at least a "1" and "2"
+    for si in list(by_staff.keys()):
+        nums = set(v["number"] for v in by_staff[si])
+        if len(nums) < 2:
+            print(f"[volta] Dropping staff {si}: only found {nums} (need >=2 for a volta pair)")
+            del by_staff[si]
 
     # For each staff with a volta pair, determine the measure range
     # using OCR-detected measure numbers (not estimation)
@@ -265,52 +279,69 @@ def _find_volta_texts_and_measures(img: np.ndarray, staves: list[dict]) -> tuple
         if zone_bottom - zone_top < 10:
             continue
 
-        zone = img[zone_top:zone_bottom, :, :]
-        result, _ = ocr(zone)
-        if not result:
-            continue
+        # Run OCR on TWO overlapping zones and merge results.
+        # OCR is non-deterministic — running on slightly different crops
+        # catches volta numbers that one pass might miss.
+        volta_y_est = staff["top"] - int(spacing * 3)
+        tight_top = max(zone_top, volta_y_est - 75)
+        tight_bot = min(zone_bottom, volta_y_est + 75)
+
+        zones_to_scan = [(zone_top, zone_bottom)]  # full zone
+        if tight_bot - tight_top >= 50:
+            zones_to_scan.append((tight_top, tight_bot))  # tight band
 
         zone_height = zone_bottom - zone_top
         volta_y_max = zone_top + zone_height * 0.6
 
         measures_on_staff = []
+        found_volta_keys = set()  # (number, approximate_x) to deduplicate
 
-        for box, text, conf in result:
-            text_clean = text.strip().rstrip(".,;:")
-            box_y = int(min(p[1] for p in box)) + zone_top
-            box_x = int(min(p[0] for p in box))
-            box_width = int(max(p[0] for p in box)) - box_x
+        for zt, zb in zones_to_scan:
+            zone = img[zt:zb, :, :]
+            result, _ = ocr(zone)
+            if not result:
+                continue
 
-            # Volta text: single digit 1-3, in upper portion, narrow
-            # OCR sometimes reads "1" as "I" (capital i) or "l" (lowercase L)
-            volta_number = None
-            if text_clean in ("1", "I", "l") and box_y < volta_y_max:
-                volta_number = 1
-            elif text_clean in ("2",) and box_y < volta_y_max:
-                volta_number = 2
-            elif text_clean in ("3",) and box_y < volta_y_max:
-                volta_number = 3
+            for box, text, conf in result:
+                text_clean = text.strip().rstrip(".,;:")
+                box_y = int(min(p[1] for p in box)) + zt
+                box_x = int(min(p[0] for p in box))
+                box_width = int(max(p[0] for p in box)) - box_x
 
-            if volta_number is not None:
-                if box_width < spacing * 4:
-                    volta_texts.append({
-                        "number": volta_number,
-                        "x": box_x,
-                        "y": box_y,
-                        "staff_index": staff["index"],
-                        "confidence": conf,
-                    })
+                volta_number = _parse_volta_number(text_clean)
 
-            # Measure number: 2-3 digit number in lower portion (near staff)
-            elif text_clean.isdigit() and 2 <= len(text_clean) <= 3 and box_y >= volta_y_max:
-                num = int(text_clean)
-                if 1 <= num <= 200:  # reasonable measure range
-                    measures_on_staff.append(num)
+                if volta_number is not None and box_y < volta_y_max:
+                    if box_width < spacing * 4:
+                        dedup_key = (volta_number, box_x // 100)
+                        if dedup_key not in found_volta_keys:
+                            found_volta_keys.add(dedup_key)
+                            volta_texts.append({
+                                "number": volta_number,
+                                "x": box_x,
+                                "y": box_y,
+                                "staff_index": staff["index"],
+                                "confidence": conf,
+                            })
+                elif text_clean.isdigit() and 2 <= len(text_clean) <= 3 and box_y >= volta_y_max:
+                    num = int(text_clean)
+                    if 1 <= num <= 200:
+                        measures_on_staff.append(num)
 
         if measures_on_staff:
             staff_measures[staff["index"]] = sorted(measures_on_staff)
 
     return volta_texts, staff_measures
+
+
+def _parse_volta_number(text: str) -> int | None:
+    """Parse a volta number from OCR text, handling common misreads."""
+    if text in ("1", "I", "l"):
+        return 1
+    if text == "2":
+        return 2
+    if text == "3":
+        return 3
+    return None
 
 
 def _build_volta_endings(
