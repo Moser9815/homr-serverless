@@ -25,11 +25,11 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Pre-download HOMR models during build (avoids cold-start download)
-RUN python -c "from homr.main import download_weights; download_weights(use_gpu_inference=True)"
+RUN python3 -c "from homr.main import download_weights; download_weights(use_gpu_inference=True)"
 
 # Copy handler code
 COPY handler.py .
 COPY parse_musicxml.py .
 COPY detect_voltas.py .
 
-CMD ["python", "-u", "handler.py"]
+CMD ["python3", "-u", "handler.py"]
