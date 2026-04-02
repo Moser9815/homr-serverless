@@ -4,11 +4,12 @@
 # Core OMR engine
 homr>=0.6.2
 
-# GPU inference (replaces CPU onnxruntime that homr pulls in)
+# GPU inference — replaces the CPU onnxruntime that homr pulls in.
+# onnxruntime-gpu bundles its own CUDA/cuDNN libs, so no CUDA base image needed.
 onnxruntime-gpu>=1.17.0
 
 # RunPod serverless SDK
 runpod>=1.7.0
 
-# Image handling (likely already pulled by homr, but pin for clarity)
+# Image handling
 Pillow>=10.0.0
