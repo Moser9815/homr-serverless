@@ -1,11 +1,19 @@
 """
 Volta Bracket Detector — Post-processing for HOMR OMR output.
 
+Volta brackets (1st/2nd/3rd endings) follow a consistent pattern:
+- LEFT of backward repeat: 1+ closed brackets, each covering specific bars.
+  Volta 1 is leftmost, volta 2 next, etc. Only one plays per pass.
+- RIGHT of backward repeat: 1 open-ended bracket (highest number).
+  Runs from the backward repeat to the next forward repeat start.
+  Played on the final pass after skipping all left-side voltas.
+
 Strategy:
-1. Start from HOMR's detected repeat barlines (from MusicXML)
-2. Find horizontal bracket lines near those repeats
-3. Read the number at the bracket's start, requiring co-location
-4. If we find "2", infer "1" from the bracket to its left
+1. Find horizontal bracket lines near repeat barlines
+2. Read the number at each bracket's start via OCR
+3. Use "2 implies 1" inference for OCR misreads
+4. Count measures under left-side brackets using barline spacing
+5. Right-side bracket length = distance to next forward repeat
 
 This code is licensed under AGPL-3.0 to comply with HOMR's license.
 """
@@ -53,61 +61,95 @@ def detect_voltas(
     # Detect measure numbers on each staff for measure-to-staff mapping
     staff_measures = _detect_measure_numbers(img, staves, total_measures or 53)
 
-    # For each repeat marker, look for volta brackets near it
+    # Compute average barline spacing per staff (for measure width estimation)
+    staff_barline_spacing = _compute_barline_spacing(barline_info, staves)
+
     num_staves = len(staves)
     mps = max(1, (total_measures or 53) / num_staves)
 
     result = list(repeat_markers)
 
     for idx, rm in enumerate(result):
-        # Which staff is the repeat's end measure on?
         end_staff_idx = _find_staff_for_measure(rm["end_measure"], staves, staff_measures, mps)
         if end_staff_idx is None:
             continue
 
+        # Find the next repeat's start measure (for open-ended volta length)
+        next_start = _find_next_repeat_start(idx, result, total_measures)
+
         # Look for bracket lines in the gap ABOVE this staff
-        volta_pair = _find_volta_pair_near_repeat(
-            img, binary, staves, end_staff_idx, w
-        )
+        brackets = _find_volta_brackets(img, binary, staves, end_staff_idx, w)
 
-        if volta_pair:
-            voltas = _build_volta_endings(
-                volta_pair, rm["start_measure"], rm["end_measure"]
-            )
-            result[idx] = dict(rm, volta_endings=voltas)
-            print(f"[volta] Repeat m{rm['start_measure']}-m{rm['end_measure']}: "
-                  f"added volta endings {voltas}")
-
-        # Also check gaps above subsequent staves (cross-staff voltas).
-        # The volta bracket can be several staves away from where the repeat
-        # ends (e.g., m45 maps to staff 5 but volta is above staff 7).
-        if not volta_pair:
+        if not brackets:
+            # Cross-staff search: volta may be above a subsequent staff
             for check_idx in range(end_staff_idx + 1, min(end_staff_idx + 4, num_staves)):
-                volta_pair = _find_volta_pair_near_repeat(
-                    img, binary, staves, check_idx, w
-                )
-                if volta_pair:
-                    voltas = _build_volta_endings(
-                        volta_pair, rm["start_measure"], rm["end_measure"]
-                    )
-                    result[idx] = dict(rm, volta_endings=voltas)
-                    print(f"[volta] Repeat m{rm['start_measure']}-m{rm['end_measure']}: "
-                          f"added volta endings {voltas} (cross-staff, staff {check_idx})")
+                brackets = _find_volta_brackets(img, binary, staves, check_idx, w)
+                if brackets:
                     break
+
+        if brackets:
+            avg_spacing = staff_barline_spacing.get(end_staff_idx, 0)
+            voltas = _build_volta_endings(
+                brackets, rm["end_measure"], next_start, avg_spacing
+            )
+            if voltas:
+                num_voltas = max(v for iters in voltas.values() for v in iters)
+                result[idx] = dict(rm, volta_endings=voltas, repeat_count=num_voltas)
+                print(f"[volta] Repeat m{rm['start_measure']}-m{rm['end_measure']}: "
+                      f"volta endings {voltas} (repeat_count={num_voltas})")
 
     return result
 
 
-def _find_volta_pair_near_repeat(
+def _find_next_repeat_start(current_idx: int, repeat_markers: list[dict], total_measures: int) -> int:
+    """Find the start_measure of the next repeat marker after the current one."""
+    current_end = repeat_markers[current_idx]["end_measure"]
+    best = total_measures + 1  # default: end of piece
+    for i, rm in enumerate(repeat_markers):
+        if i != current_idx and rm["start_measure"] > current_end:
+            best = min(best, rm["start_measure"])
+    return best
+
+
+def _compute_barline_spacing(barline_info: list[dict] | None, staves: list[dict]) -> dict[int, float]:
+    """Compute average distance between consecutive barlines on each staff."""
+    if not barline_info:
+        return {}
+
+    # Group barlines by staff, sort by x
+    staff_barlines: dict[int, list[float]] = {}
+    for bl in barline_info:
+        idx = bl["staff_idx"]
+        if idx not in staff_barlines:
+            staff_barlines[idx] = []
+        staff_barlines[idx].append(bl["x"])
+
+    result = {}
+    for idx, positions in staff_barlines.items():
+        positions.sort()
+        if len(positions) >= 2:
+            gaps = [positions[i+1] - positions[i] for i in range(len(positions) - 1)]
+            # Filter out tiny gaps (paired repeat barlines ~17px) — use median
+            # to be robust against these outliers
+            result[idx] = float(np.median(gaps))
+
+    return result
+
+
+def _find_volta_brackets(
     img: np.ndarray,
     binary: np.ndarray,
     staves: list[dict],
     staff_idx: int,
     img_width: int,
-) -> list[int] | None:
+) -> list[dict] | None:
     """
-    Look for volta bracket lines + numbers in the gap above the given staff.
-    Returns sorted list of volta numbers [1, 2] or None.
+    Find volta bracket lines + numbers in the gap above the given staff.
+
+    Returns list of bracket dicts with:
+    - x, y, width, height (pixel coords)
+    - number: volta number (1, 2, 3...)
+    Sorted left-to-right. Returns None if no valid volta pair found.
     """
     if staff_idx == 0:
         return None
@@ -158,9 +200,8 @@ def _find_volta_pair_near_repeat(
     except ImportError:
         return None
 
-    identified = {}
     for bi, bracket in enumerate(brackets):
-        # Crop near the left end of the bracket — the number sits here
+        # Crop near the left end of the bracket
         left_x = max(0, bracket["x"] - int(spacing))
         right_x = min(img_width, bracket["x"] + int(spacing * 5))
         top_y = bracket["y"]
@@ -172,38 +213,106 @@ def _find_volta_pair_near_repeat(
         crop = img[top_y:bot_y, left_x:right_x, :]
         result, _ = ocr(crop)
 
+        bracket["number"] = None
         if not result:
             continue
 
         for box, text, conf in result:
             tc = text.strip().rstrip(".,;:")
-            # Require: the detected text must be CLOSE to the bracket line
-            # (within 2x spacing vertically) — rejects distant rehearsal marks
             text_y = int(min(p[1] for p in box))
             if text_y > spacing * 2:
-                continue  # too far below the bracket line
+                continue
 
             if tc in ("1", "I", "l"):
-                identified[bi] = 1
+                bracket["number"] = 1
             elif tc == "2":
-                identified[bi] = 2
+                bracket["number"] = 2
             elif tc == "3":
-                identified[bi] = 3
+                bracket["number"] = 3
+            elif tc == "4":
+                bracket["number"] = 4
 
-    # Infer "1" from "2"
-    for bi, num in list(identified.items()):
-        if num == 2 and bi > 0 and (bi - 1) not in identified:
-            identified[bi - 1] = 1
-        elif num == 2 and bi == 0:
-            # "2" is leftmost bracket — "1" must be on previous staff (cross-staff)
-            # or there's a bracket we missed. Create synthetic.
-            identified[-1] = 1  # synthetic, will be handled below
+    # Infer "1" from "2": if bracket[i] is "2" and bracket[i-1] has no number
+    for bi in range(len(brackets)):
+        num = brackets[bi].get("number")
+        if num == 2 and bi > 0 and brackets[bi - 1].get("number") is None:
+            brackets[bi - 1]["number"] = 1
 
-    volta_numbers = sorted(set(identified.values()))
-    if len(volta_numbers) >= 2:
-        return volta_numbers
+    # Filter to only brackets with identified numbers
+    numbered = [b for b in brackets if b.get("number") is not None]
+    if len(numbered) < 2:
+        return None
 
-    return None
+    # Need at least two different volta numbers
+    numbers = set(b["number"] for b in numbered)
+    if len(numbers) < 2:
+        return None
+
+    return numbered
+
+
+def _build_volta_endings(
+    brackets: list[dict],
+    end_measure: int,
+    next_repeat_start: int,
+    avg_barline_spacing: float,
+) -> dict[str, list[int]] | None:
+    """
+    Build volta endings from detected brackets.
+
+    Left-side brackets (closed): measure count from bracket width / barline spacing.
+    Working backward from end_measure.
+
+    Right-side bracket (open-ended, highest number): from end_measure+1 to
+    next_repeat_start-1.
+    """
+    if not brackets or avg_barline_spacing <= 0:
+        return None
+
+    # Sort by x position
+    brackets = sorted(brackets, key=lambda b: b["x"])
+
+    # Find the highest volta number — that's the open-ended one on the right
+    max_volta = max(b["number"] for b in brackets)
+
+    # Separate left-side (closed) and right-side (open) brackets
+    # The right-side bracket is the one with the highest number
+    # In most cases: volta 1 left, volta 2 right (2-volta)
+    # Or: volta 1 left, volta 2 left, volta 3 right (3-volta)
+    right_brackets = [b for b in brackets if b["number"] == max_volta]
+    left_brackets = [b for b in brackets if b["number"] != max_volta]
+
+    # Sort left brackets by number (volta 1, 2, ...)
+    left_brackets.sort(key=lambda b: b["number"])
+
+    volta_endings = {}
+
+    # Process left-side brackets: work backward from end_measure
+    cursor = end_measure  # the last measure before the backward repeat
+    for bracket in reversed(left_brackets):
+        # Estimate how many measures this bracket covers
+        num_measures = max(1, round(bracket["width"] / avg_barline_spacing))
+
+        # Assign measures working backward from cursor
+        start = cursor - num_measures + 1
+        for m in range(start, cursor + 1):
+            volta_endings[str(m)] = [bracket["number"]]
+
+        cursor = start - 1  # next bracket ends before this one starts
+
+    # Process right-side bracket: end_measure+1 to next_repeat_start-1
+    if right_brackets:
+        right_start = end_measure + 1
+        right_end = next_repeat_start - 1
+        if right_end >= right_start:
+            for m in range(right_start, right_end + 1):
+                volta_endings[str(m)] = [max_volta]
+
+    if volta_endings:
+        print(f"[volta] Bracket analysis: left={[(b['number'], round(b['width']/avg_barline_spacing)) for b in left_brackets]}bars "
+              f"right=volta{max_volta} m{end_measure+1}-m{next_repeat_start-1}")
+
+    return volta_endings if volta_endings else None
 
 
 def _find_staff_for_measure(
@@ -213,24 +322,20 @@ def _find_staff_for_measure(
     measures_per_staff: float,
 ) -> int | None:
     """Find which staff index contains a given measure number."""
-    # First try exact match from OCR-detected measure numbers
     for si, measures in staff_measures.items():
         if measure in measures:
             return si
-        # Also check if measure falls within the range of this staff
         if measures and min(measures) <= measure <= max(measures):
             return si
 
-    # Check if it falls in the range between detected measures of adjacent staves
     sorted_staves = sorted(staff_measures.keys())
     for i, si in enumerate(sorted_staves):
         curr_max = max(staff_measures[si])
         if i + 1 < len(sorted_staves):
             next_min = min(staff_measures[sorted_staves[i + 1]])
             if curr_max < measure < next_min:
-                return si  # measure is after this staff's last detected number
+                return si
 
-    # Fallback to estimation
     num_staves = len(staves)
     est = min(int((measure - 1) / measures_per_staff), num_staves - 1)
     return est
@@ -278,14 +383,6 @@ def _detect_measure_numbers(img, staves, total_measures):
             staff_measures[i] = sorted(set(measures))
 
     return staff_measures
-
-
-def _build_volta_endings(volta_numbers, start_measure, end_measure):
-    """Build volta endings dict."""
-    num_voltas = len(volta_numbers)
-    measures_for_voltas = min(num_voltas, end_measure - start_measure + 1)
-    volta_start = end_measure - measures_for_voltas + 1
-    return {str(volta_start + i): [vnum] for i, vnum in enumerate(volta_numbers)}
 
 
 def _find_staves(gray, w, h):
