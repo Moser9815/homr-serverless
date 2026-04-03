@@ -7,6 +7,7 @@ on:
       - 'Dockerfile'
       - 'handler.py'
       - 'parse_musicxml.py'
+      - 'detect_repeats.py'
       - 'detect_voltas.py'
       - 'requirements.txt'
   workflow_dispatch:

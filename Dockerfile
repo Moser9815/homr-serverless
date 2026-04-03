@@ -58,6 +58,7 @@ RUN python3 -c "from homr.main import download_weights; download_weights(use_gpu
 # Copy handler code
 COPY handler.py .
 COPY parse_musicxml.py .
+COPY detect_repeats.py .
 COPY detect_voltas.py .
 
 CMD ["python3", "-u", "handler.py"]

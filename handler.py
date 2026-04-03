@@ -26,6 +26,7 @@ import runpod
 
 from parse_musicxml import parse_musicxml_to_json
 from detect_voltas import detect_voltas
+from detect_repeats import detect_repeat_barlines, build_repeat_markers
 
 
 def decode_image(base64_data: str) -> Image.Image:
@@ -263,11 +264,32 @@ def handler(event):
                 default_time_signature=time_signature,
             )
 
-            # Post-process: detect voltas
+            # Post-process step 1: classify barlines as repeat/normal
+            # using image-based dot detection (replaces HOMR's unreliable transformer)
+            total_m = parsed.get("metadata", {}).get("total_measures", 0)
+            repeat_status = "skipped"
             repeat_markers = parsed.get("repeat_markers", [])
+            homr_repeat_count = len(repeat_markers)
+            try:
+                classified_barlines = detect_repeat_barlines(
+                    tmp_path, barline_info, staff_info,
+                    total_measures=total_m, debug=True,
+                )
+                custom_markers = build_repeat_markers(classified_barlines, debug=True)
+                if custom_markers:
+                    # Custom detection found repeats — use these instead of HOMR's
+                    repeat_markers = custom_markers
+                    repeat_status = f"custom:{len(custom_markers)} (homr:{homr_repeat_count})"
+                else:
+                    # No repeats found by custom detector — fall back to HOMR's
+                    repeat_status = f"homr_fallback:{homr_repeat_count}"
+            except Exception as e:
+                repeat_status = f"error: {e}"
+                traceback.print_exc()
+
+            # Post-process step 2: detect voltas (augments repeat markers)
             volta_status = "skipped"
             try:
-                total_m = parsed.get("metadata", {}).get("total_measures", 0)
                 repeat_markers = detect_voltas(
                     tmp_path, repeat_markers, total_m,
                     staff_info=staff_info, barline_info=barline_info,
@@ -285,6 +307,7 @@ def handler(event):
             metadata = parsed.get("metadata", {})
             metadata["processing_time"] = round(processing_time, 2)
             metadata["detection_method"] = "homr"
+            metadata["repeat_detection"] = repeat_status
             metadata["volta_detection"] = volta_status
             metadata["staves_detected"] = len(staff_info)
             metadata["barlines_detected"] = len(barline_info)
