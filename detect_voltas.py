@@ -69,6 +69,10 @@ def detect_voltas(
 
     result = list(repeat_markers)
 
+    # Track which staff gaps have had their brackets claimed, so the same
+    # brackets aren't assigned to multiple repeat markers.
+    used_staff_gaps = set()
+
     for idx, rm in enumerate(result):
         end_staff_idx = _find_staff_for_measure(rm["end_measure"], staves, staff_measures, mps)
         if end_staff_idx is None:
@@ -78,16 +82,25 @@ def detect_voltas(
         next_start = _find_next_repeat_start(idx, result, total_measures)
 
         # Look for bracket lines in the gap ABOVE this staff
-        brackets = _find_volta_brackets(img, binary, staves, end_staff_idx, w)
+        brackets = None
+        found_staff = None
+        if end_staff_idx not in used_staff_gaps:
+            brackets = _find_volta_brackets(img, binary, staves, end_staff_idx, w)
+            if brackets:
+                found_staff = end_staff_idx
 
         if not brackets:
             # Cross-staff search: volta may be above a subsequent staff
             for check_idx in range(end_staff_idx + 1, min(end_staff_idx + 4, num_staves)):
+                if check_idx in used_staff_gaps:
+                    continue
                 brackets = _find_volta_brackets(img, binary, staves, check_idx, w)
                 if brackets:
+                    found_staff = check_idx
                     break
 
-        if brackets:
+        if brackets and found_staff is not None:
+            used_staff_gaps.add(found_staff)
             avg_spacing = staff_barline_spacing.get(end_staff_idx, 0)
             voltas = _build_volta_endings(
                 brackets, rm["end_measure"], next_start, avg_spacing
@@ -194,11 +207,8 @@ def _find_volta_brackets(
     brackets.sort(key=lambda b: b["x"])
 
     # OCR each bracket's left end to read the number
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        ocr = RapidOCR()
-    except ImportError:
-        return None
+    from rapidocr_onnxruntime import RapidOCR
+    ocr = RapidOCR()
 
     for bi, bracket in enumerate(brackets):
         # Crop near the left end of the bracket
