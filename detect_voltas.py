@@ -14,8 +14,6 @@ import cv2
 import numpy as np
 
 
-_volta_debug = {}  # Module-level debug info, accessible after detection
-
 def detect_voltas(
     image_path: str,
     repeat_markers: list[dict],
@@ -24,9 +22,6 @@ def detect_voltas(
     barline_info: list[dict] | None = None,
 ) -> list[dict]:
     """Detect volta brackets near repeat barlines and merge with repeat markers."""
-    global _volta_debug
-    _volta_debug = {"repeat_markers_in": len(repeat_markers), "checks": []}
-
     if not repeat_markers:
         return repeat_markers
 
@@ -65,50 +60,40 @@ def detect_voltas(
     result = list(repeat_markers)
 
     for idx, rm in enumerate(result):
-        check = {"repeat": f"m{rm['start_measure']}-m{rm['end_measure']}"}
-
         # Which staff is the repeat's end measure on?
         end_staff_idx = _find_staff_for_measure(rm["end_measure"], staves, staff_measures, mps)
-        check["end_staff_idx"] = end_staff_idx
         if end_staff_idx is None:
-            check["result"] = "no staff found"
-            _volta_debug["checks"].append(check)
             continue
 
         # Look for bracket lines in the gap ABOVE this staff
-        volta_pair, pair_debug = _find_volta_pair_near_repeat(
+        volta_pair = _find_volta_pair_near_repeat(
             img, binary, staves, end_staff_idx, w
         )
-        check["primary_check"] = pair_debug
 
         if volta_pair:
             voltas = _build_volta_endings(
                 volta_pair, rm["start_measure"], rm["end_measure"]
             )
             result[idx] = dict(rm, volta_endings=voltas)
-            check["result"] = f"found via primary: {voltas}"
             print(f"[volta] Repeat m{rm['start_measure']}-m{rm['end_measure']}: "
                   f"added volta endings {voltas}")
 
-        # Also check the gap above the NEXT staff (cross-staff voltas)
-        if not volta_pair and end_staff_idx + 1 < num_staves:
-            volta_pair, pair_debug2 = _find_volta_pair_near_repeat(
-                img, binary, staves, end_staff_idx + 1, w
-            )
-            check["cross_staff_check"] = pair_debug2
-            if volta_pair:
-                voltas = _build_volta_endings(
-                    volta_pair, rm["start_measure"], rm["end_measure"]
+        # Also check gaps above subsequent staves (cross-staff voltas).
+        # The volta bracket can be several staves away from where the repeat
+        # ends (e.g., m45 maps to staff 5 but volta is above staff 7).
+        if not volta_pair:
+            for check_idx in range(end_staff_idx + 1, min(end_staff_idx + 4, num_staves)):
+                volta_pair = _find_volta_pair_near_repeat(
+                    img, binary, staves, check_idx, w
                 )
-                result[idx] = dict(rm, volta_endings=voltas)
-                check["result"] = f"found via cross-staff: {voltas}"
-                print(f"[volta] Repeat m{rm['start_measure']}-m{rm['end_measure']}: "
-                      f"added volta endings {voltas} (cross-staff)")
-
-        if "result" not in check:
-            check["result"] = "not found"
-
-        _volta_debug["checks"].append(check)
+                if volta_pair:
+                    voltas = _build_volta_endings(
+                        volta_pair, rm["start_measure"], rm["end_measure"]
+                    )
+                    result[idx] = dict(rm, volta_endings=voltas)
+                    print(f"[volta] Repeat m{rm['start_measure']}-m{rm['end_measure']}: "
+                          f"added volta endings {voltas} (cross-staff, staff {check_idx})")
+                    break
 
     return result
 
@@ -119,35 +104,27 @@ def _find_volta_pair_near_repeat(
     staves: list[dict],
     staff_idx: int,
     img_width: int,
-) -> tuple[list[int] | None, dict]:
+) -> list[int] | None:
     """
     Look for volta bracket lines + numbers in the gap above the given staff.
-    Returns (sorted list of volta numbers [1, 2] or None, debug_info dict).
+    Returns sorted list of volta numbers [1, 2] or None.
     """
-    debug = {"staff_idx": staff_idx}
-
     if staff_idx == 0:
-        debug["skip"] = "staff_idx == 0"
-        return None, debug
+        return None
 
     prev_bottom = staves[staff_idx - 1]["bottom"]
     curr_top = staves[staff_idx]["top"]
     spacing = staves[staff_idx]["spacing"]
     gap = curr_top - prev_bottom
-    debug["zone"] = f"y={prev_bottom + int(spacing)}-{curr_top - int(spacing * 0.5)}"
-    debug["gap"] = gap
-    debug["spacing"] = spacing
 
     if gap < spacing * 2:
-        debug["skip"] = f"gap {gap} < spacing*2 {spacing*2}"
-        return None, debug
+        return None
 
     zone_top = prev_bottom + int(spacing)
     zone_bot = curr_top - int(spacing * 0.5)
 
     if zone_bot - zone_top < 10:
-        debug["skip"] = "zone too small"
-        return None, debug
+        return None
 
     zone_bin = binary[zone_top:zone_bot, :]
 
@@ -158,11 +135,9 @@ def _find_volta_pair_near_repeat(
 
     contours, _ = cv2.findContours(horiz_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    all_contours = []
     brackets = []
     for cnt in contours:
         x, y, cw, ch = cv2.boundingRect(cnt)
-        all_contours.append({"x": x, "y": y + zone_top, "w": cw, "h": ch})
         if cw > spacing * 5 and ch < spacing * 2 and cw < img_width * 0.7:
             brackets.append({
                 "x": x,
@@ -171,13 +146,8 @@ def _find_volta_pair_near_repeat(
                 "height": ch,
             })
 
-    debug["contours_total"] = len(all_contours)
-    debug["contours_all"] = all_contours[:10]  # first 10 for debugging
-    debug["brackets_passing_filter"] = len(brackets)
-
     if not brackets:
-        debug["skip"] = f"no brackets (had {len(all_contours)} contours, none passed filter)"
-        return None, debug
+        return None
 
     brackets.sort(key=lambda b: b["x"])
 
@@ -186,12 +156,11 @@ def _find_volta_pair_near_repeat(
         from rapidocr_onnxruntime import RapidOCR
         ocr = RapidOCR()
     except ImportError:
-        debug["skip"] = "rapidocr not available"
-        return None, debug
+        return None
 
     identified = {}
-    ocr_results = []
     for bi, bracket in enumerate(brackets):
+        # Crop near the left end of the bracket — the number sits here
         left_x = max(0, bracket["x"] - int(spacing))
         right_x = min(img_width, bracket["x"] + int(spacing * 5))
         top_y = bracket["y"]
@@ -203,43 +172,38 @@ def _find_volta_pair_near_repeat(
         crop = img[top_y:bot_y, left_x:right_x, :]
         result, _ = ocr(crop)
 
-        bracket_ocr = {"bracket_idx": bi, "crop": f"y={top_y}-{bot_y} x={left_x}-{right_x}", "texts": []}
-        if result:
-            for box, text, conf in result:
-                tc = text.strip().rstrip(".,;:")
-                text_y = int(min(p[1] for p in box))
-                bracket_ocr["texts"].append({"text": tc, "conf": round(conf, 2), "y": text_y})
-                if text_y > spacing * 2:
-                    continue
+        if not result:
+            continue
 
-                if tc in ("1", "I", "l"):
-                    identified[bi] = 1
-                elif tc == "2":
-                    identified[bi] = 2
-                elif tc == "3":
-                    identified[bi] = 3
+        for box, text, conf in result:
+            tc = text.strip().rstrip(".,;:")
+            # Require: the detected text must be CLOSE to the bracket line
+            # (within 2x spacing vertically) — rejects distant rehearsal marks
+            text_y = int(min(p[1] for p in box))
+            if text_y > spacing * 2:
+                continue  # too far below the bracket line
 
-        ocr_results.append(bracket_ocr)
-
-    debug["ocr_results"] = ocr_results
-    debug["identified_before_infer"] = dict(identified)
+            if tc in ("1", "I", "l"):
+                identified[bi] = 1
+            elif tc == "2":
+                identified[bi] = 2
+            elif tc == "3":
+                identified[bi] = 3
 
     # Infer "1" from "2"
     for bi, num in list(identified.items()):
         if num == 2 and bi > 0 and (bi - 1) not in identified:
             identified[bi - 1] = 1
         elif num == 2 and bi == 0:
-            identified[-1] = 1  # synthetic
-
-    debug["identified_after_infer"] = dict(identified)
+            # "2" is leftmost bracket — "1" must be on previous staff (cross-staff)
+            # or there's a bracket we missed. Create synthetic.
+            identified[-1] = 1  # synthetic, will be handled below
 
     volta_numbers = sorted(set(identified.values()))
-    debug["volta_numbers"] = volta_numbers
     if len(volta_numbers) >= 2:
-        return volta_numbers, debug
+        return volta_numbers
 
-    debug["skip"] = f"insufficient volta numbers: {volta_numbers}"
-    return None, debug
+    return None
 
 
 def _find_staff_for_measure(
