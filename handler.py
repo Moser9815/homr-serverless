@@ -1,8 +1,8 @@
 """
 HOMR OMR — RunPod Serverless Handler
 
-Calls HOMR's Python API directly (not CLI) to access internal staff/barline
-data for accurate volta detection and note pixel positions.
+Calls HOMR's Python API directly to access internal staff, barline,
+and note pixel positions from the segmentation pipeline.
 
 This code is licensed under AGPL-3.0 to comply with HOMR's license.
 """
@@ -38,23 +38,41 @@ def decode_image(base64_data: str) -> Image.Image:
     return img
 
 
-def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict], list[dict]]:
+def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict], list[dict], list[dict]]:
     """
-    Run HOMR via Python API. Returns:
+    Run HOMR via Python API, capturing barline and note pixel positions
+    that the standard pipeline discards.
+
+    Returns:
     - musicxml_path: path to the output MusicXML file
     - staff_info: list of staff dicts with pixel positions
     - barline_info: list of barline dicts with pixel positions
+    - note_info: list of note dicts with pixel positions
     """
+    # Import HOMR internals
     from homr.main import (
         ProcessingConfig,
-        detect_staffs_in_image,
+        load_and_preprocess_predictions,
+        predict_symbols,
+        break_wide_fragments,
+        combine_noteheads_with_stems,
+        detect_bar_lines,
+        detect_staff,
+        detect_title,
+        add_notes_to_staffs,
+        prepare_brace_dot_image,
+        create_rotated_bounding_boxes,
+        find_braces_brackets_and_grand_staff_lines,
+        prepare_bar_line_image,
         parse_staffs,
     )
+    from homr.model import BarLine
     from homr.transformer.configs import Config as TransformerConfig
     from homr.simple_logging import eprint
     from homr.music_xml_generator import generate_xml, XmlGeneratorArguments
+    import numpy as np
 
-    print(f"[HOMR] Processing {image_path} via Python API")
+    print(f"[HOMR] Processing {image_path} via Python API (with barline capture)")
     start = time.time()
 
     config = ProcessingConfig(
@@ -66,18 +84,75 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
         use_gpu_inference=use_gpu,
     )
 
-    # Step 1: Detect staffs (segmentation + staff detection)
-    multi_staffs, image, debug, title_future = detect_staffs_in_image(image_path, config)
+    # === Run the pipeline manually to capture bar_line_boxes ===
+
+    # Step 1: Load and preprocess
+    predictions, debug = load_and_preprocess_predictions(
+        image_path, config.enable_debug, config.enable_cache, config.use_gpu_inference
+    )
+    symbols = predict_symbols(debug, predictions)
+    symbols.staff_fragments = break_wide_fragments(symbols.staff_fragments)
+
+    # Step 2: Noteheads
+    noteheads_with_stems = combine_noteheads_with_stems(symbols.noteheads, symbols.stems_rest)
+    if len(noteheads_with_stems) == 0:
+        raise Exception("No noteheads found")
+
+    average_note_head_height = float(
+        np.median([nh.notehead.size[1] for nh in noteheads_with_stems])
+    )
+
+    # Step 3: Barlines — CAPTURE THESE (normally discarded)
+    all_noteheads = [nh.notehead for nh in noteheads_with_stems]
+    all_stems = [n.stem for n in noteheads_with_stems if n.stem is not None]
+    bar_lines_or_rests = [
+        line for line in symbols.bar_lines
+        if not line.is_overlapping_with_any(all_noteheads)
+        and not line.is_overlapping_with_any(all_stems)
+    ]
+    bar_line_boxes = detect_bar_lines(bar_lines_or_rests, average_note_head_height)
+    print(f"[HOMR] Captured {len(bar_line_boxes)} barline boxes from segmentation")
+
+    # Step 4: Staff detection
+    staffs = detect_staff(
+        debug, predictions.staff, symbols.staff_fragments,
+        symbols.clefs_keys, bar_line_boxes
+    )
+    if len(staffs) == 0:
+        raise Exception("No staffs found")
+
+    title_future = detect_title(debug, staffs[0])
+
+    # Step 5: Add notes to staves (gives notes pixel positions)
+    notes = add_notes_to_staffs(
+        staffs, noteheads_with_stems, predictions.symbols, predictions.notehead
+    )
+
+    # Step 6: ADD BARLINES TO STAVES (the missing step!)
+    barlines_assigned = 0
+    for blbox in bar_line_boxes:
+        for staff in staffs:
+            if staff.is_on_staff_zone(blbox):
+                staff.add_symbol(BarLine(blbox))
+                barlines_assigned += 1
+                break
+    print(f"[HOMR] Assigned {barlines_assigned} barlines to staves")
+
+    # Step 7: Grand staff detection
+    brace_dot_img = prepare_brace_dot_image(predictions.symbols, predictions.staff)
+    brace_dot = create_rotated_bounding_boxes(brace_dot_img, skip_merging=True, max_size=(100, -1))
+    multi_staffs = find_braces_brackets_and_grand_staff_lines(debug, staffs, brace_dot)
 
     elapsed_detect = time.time() - start
-    print(f"[HOMR] Staff detection: {elapsed_detect:.1f}s")
+    print(f"[HOMR] Staff detection: {elapsed_detect:.1f}s, "
+          f"{len(staffs)} staves, {barlines_assigned} barlines, {len(notes)} notes")
 
-    # Step 3: Run transformer (symbol recognition)
+    # Step 8: Transformer (symbol recognition → MusicXML)
     transformer_config = TransformerConfig()
     transformer_config.use_gpu_inference = use_gpu
 
     result_staffs = parse_staffs(
-        debug, multi_staffs, image,
+        debug, multi_staffs, predictions.preprocessed,
         selected_staff=-1, config=transformer_config,
     )
 
@@ -87,51 +162,7 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
     except Exception:
         pass
 
-    # Step 4: Extract staff pixel data, scaled to original image coordinates
-    # HOMR resizes the image before processing — need to scale back
-    import cv2 as _cv2
-    original = _cv2.imread(image_path)
-    orig_h, orig_w = original.shape[:2]
-    proc_h, proc_w = image.shape[:2]
-    scale_x = orig_w / proc_w
-    scale_y = orig_h / proc_h
-
-    staff_info = []
-    barline_info = []
-    staff_counter = 0
-
-    for ms_idx, multi_staff in enumerate(multi_staffs):
-        for s_idx, staff in enumerate(multi_staff.staffs):
-            staff_data = {
-                "multi_staff": ms_idx,
-                "staff": staff_counter,
-                "min_x": float(staff.min_x * scale_x),
-                "max_x": float(staff.max_x * scale_x),
-                "min_y": float(staff.min_y * scale_y),
-                "max_y": float(staff.max_y * scale_y),
-                "unit_size": float(staff.average_unit_size * scale_y),
-                "is_grand": staff.is_grandstaff,
-            }
-            staff_info.append(staff_data)
-
-            # Extract barlines from staff symbols
-            for barline in staff.get_bar_lines():
-                cx, cy = barline.box.center
-                bw, bh = barline.box.size
-                barline_info.append({
-                    "staff_idx": staff_counter,
-                    "x": float(cx * scale_x),
-                    "y": float(cy * scale_y),
-                    "width": float(bw * scale_x),
-                    "height": float(bh * scale_y),
-                })
-
-            staff_counter += 1
-
-    print(f"[HOMR] Extracted {len(staff_info)} staves, {len(barline_info)} barlines "
-          f"(scale: {scale_x:.3f}x{scale_y:.3f})")
-
-    # Step 5: Generate MusicXML
+    # Step 9: Generate MusicXML
     xml_generator_args = XmlGeneratorArguments()
     xml = generate_xml(xml_generator_args, result_staffs, title)
 
@@ -139,9 +170,60 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
     xml.write(musicxml_path)
 
     elapsed_total = time.time() - start
-    print(f"[HOMR] Total: {elapsed_total:.1f}s, {len(result_staffs)} parsed staves")
+    print(f"[HOMR] Total: {elapsed_total:.1f}s")
 
-    return musicxml_path, staff_info, barline_info
+    # Step 10: Extract pixel data, scaled to original image coordinates
+    import cv2 as _cv2
+    original = _cv2.imread(image_path)
+    orig_h, orig_w = original.shape[:2]
+    proc_h, proc_w = predictions.preprocessed.shape[:2]
+    scale_x = orig_w / proc_w
+    scale_y = orig_h / proc_h
+
+    staff_info = []
+    barline_info = []
+    note_info = []
+
+    for ms_idx, multi_staff in enumerate(multi_staffs):
+        for s_idx, staff in enumerate(multi_staff.staffs):
+            staff_idx = len(staff_info)
+
+            staff_info.append({
+                "staff": staff_idx,
+                "min_x": float(staff.min_x * scale_x),
+                "max_x": float(staff.max_x * scale_x),
+                "min_y": float(staff.min_y * scale_y),
+                "max_y": float(staff.max_y * scale_y),
+                "unit_size": float(staff.average_unit_size * scale_y),
+            })
+
+            # Barlines on this staff
+            for barline in staff.get_bar_lines():
+                cx, cy = barline.box.center
+                bw, bh = barline.box.size
+                barline_info.append({
+                    "staff_idx": staff_idx,
+                    "x": float(cx * scale_x),
+                    "y": float(cy * scale_y),
+                    "width": float(bw * scale_x),
+                    "height": float(bh * scale_y),
+                })
+
+            # Notes on this staff
+            for note in staff.get_notes():
+                nx, ny = note.center
+                note_info.append({
+                    "staff_idx": staff_idx,
+                    "x": float(nx * scale_x),
+                    "y": float(ny * scale_y),
+                    "width": float(note.box.size[0] * scale_x),
+                    "height": float(note.box.size[1] * scale_y),
+                })
+
+    print(f"[HOMR] Extracted: {len(staff_info)} staves, "
+          f"{len(barline_info)} barlines, {len(note_info)} notes")
+
+    return musicxml_path, staff_info, barline_info, note_info
 
 
 def handler(event):
@@ -166,8 +248,10 @@ def handler(event):
             tmp_path = tmp.name
 
         try:
-            # Run HOMR via Python API (returns staff/barline data)
-            musicxml_path, staff_info, barline_info = run_homr_api(tmp_path, use_gpu=True)
+            # Run HOMR via Python API
+            musicxml_path, staff_info, barline_info, note_info = run_homr_api(
+                tmp_path, use_gpu=True
+            )
 
             with open(musicxml_path, "r", encoding="utf-8") as f:
                 musicxml_content = f.read()
@@ -179,21 +263,19 @@ def handler(event):
                 default_time_signature=time_signature,
             )
 
-            # Post-process: detect voltas using HOMR's own staff/barline data
+            # Post-process: detect voltas
             repeat_markers = parsed.get("repeat_markers", [])
             volta_status = "skipped"
             try:
                 total_m = parsed.get("metadata", {}).get("total_measures", 0)
                 repeat_markers = detect_voltas(
                     tmp_path, repeat_markers, total_m,
-                    staff_info=staff_info,
-                    barline_info=barline_info,
+                    staff_info=staff_info, barline_info=barline_info,
                 )
                 has_voltas = any(rm.get("volta_endings") for rm in repeat_markers)
                 volta_status = "detected" if has_voltas else "none_found"
             except Exception as e:
                 volta_status = f"error: {e}"
-                print(f"[volta] Detection failed (non-fatal): {e}")
                 traceback.print_exc()
 
             processing_time = time.time() - start_time
@@ -206,7 +288,7 @@ def handler(event):
             metadata["volta_detection"] = volta_status
             metadata["staves_detected"] = len(staff_info)
             metadata["barlines_detected"] = len(barline_info)
-
+            metadata["notes_with_positions"] = len(note_info)
 
             return {
                 "success": True,
@@ -219,9 +301,12 @@ def handler(event):
                 "metadata": metadata,
                 "staff_positions": staff_info,
                 "barline_positions": barline_info,
+                "note_positions": note_info,
                 "musicxml": musicxml_content,
-                "message": f"HOMR processed {len(notes)} notes, {len(rests)} rests, "
-                           f"{len(repeat_markers)} repeats in {processing_time:.1f}s",
+                "message": f"HOMR: {len(notes)} notes, {len(rests)} rests, "
+                           f"{len(repeat_markers)} repeats, "
+                           f"{len(note_info)} note positions, "
+                           f"{len(barline_info)} barline positions",
             }
 
         finally:
