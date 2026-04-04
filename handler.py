@@ -271,9 +271,13 @@ def handler(event):
             repeat_markers = parsed.get("repeat_markers", [])
             homr_repeat_count = len(repeat_markers)
             try:
+                notes_list = parsed.get("notes", [])
                 classified_barlines = detect_repeat_barlines(
                     tmp_path, barline_info, staff_info,
-                    total_measures=total_m, debug=True,
+                    total_measures=total_m,
+                    notes=notes_list,
+                    note_positions=note_info,
+                    debug=True,
                 )
                 custom_markers = build_repeat_markers(classified_barlines, debug=True)
                 if custom_markers:

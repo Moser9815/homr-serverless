@@ -29,6 +29,8 @@ def detect_repeat_barlines(
     barline_info: list[dict],
     staff_info: list[dict],
     total_measures: int = 0,
+    notes: list[dict] | None = None,
+    note_positions: list[dict] | None = None,
     debug: bool = False,
 ) -> list[dict]:
     """
@@ -41,6 +43,8 @@ def detect_repeat_barlines(
         staff_info: List of staff dicts from HOMR
             Each has: staff, min_x, max_x, min_y, max_y, unit_size
         total_measures: Expected total measures (from MusicXML, for validation)
+        notes: Notes from MusicXML with measure numbers (for measure assignment)
+        note_positions: Note pixel positions from segmentation (paired 1:1 with notes)
         debug: Print diagnostic info
 
     Returns:
@@ -98,8 +102,8 @@ def detect_repeat_barlines(
                 f"w={bl['width']:.1f} unit={unit:.1f}{edge_tag}"
             )
 
-    # Assign measure numbers
-    _assign_measure_numbers(classified, staff_info, total_measures, debug)
+    # Assign measure numbers using note data (accurate) or barline counting (fallback)
+    _assign_measure_numbers(classified, staff_info, total_measures, notes, note_positions, debug)
 
     if debug:
         repeats = [b for b in classified if b["type"] != "normal"]
@@ -256,18 +260,143 @@ def _assign_measure_numbers(
     classified: list[dict],
     staff_info: list[dict],
     total_measures: int,
+    notes: list[dict] | None,
+    note_positions: list[dict] | None,
     debug: bool,
 ) -> None:
     """
-    Assign measure numbers to each barline based on position ordering.
+    Assign measure numbers to each barline.
 
-    Within each staff, barlines sorted left-to-right separate consecutive
-    measures. N barlines = N-1 measures. However, HOMR sometimes produces
-    two boxes for a single repeat barline (thick + thin bar, ~17px apart).
-    These paired boxes represent ONE measure boundary, not two. We detect
-    pairs by proximity and assign both boxes the same measure boundary.
+    Primary method: pair MusicXML notes (with measure numbers) with segmentation
+    note positions (with staff_idx and x). For each barline, the nearest note
+    to its right determines which measure starts there.
+
+    Fallback: count barlines per staff if note data is unavailable.
     """
-    # Group by staff
+    if notes and note_positions and len(notes) == len(note_positions):
+        _assign_from_notes(classified, notes, note_positions, debug)
+    else:
+        if debug:
+            print("[detect_repeats] No note data — falling back to barline counting")
+        _assign_from_barline_count(classified, staff_info, total_measures, debug)
+
+
+def _assign_from_notes(
+    classified: list[dict],
+    notes: list[dict],
+    note_positions: list[dict],
+    debug: bool,
+) -> None:
+    """
+    Assign measure numbers using note-count fitting.
+
+    Step 1: Build staff → measure range by greedily fitting MusicXML note
+    counts to segmentation note counts per staff.
+
+    Step 2: For each barline, interpolate its x position within the staff's
+    x extent to determine which measure boundary it's at. This is robust
+    against paired repeat barlines and missing barlines.
+    """
+    from collections import Counter
+    import math
+
+    # Count notes per measure (MusicXML) and per staff (segmentation)
+    notes_per_measure = Counter(n["measure"] for n in notes)
+    notes_per_staff = Counter(np["staff_idx"] for np in note_positions)
+
+    measure_list = sorted(notes_per_measure.keys())
+    staff_list = sorted(notes_per_staff.keys())
+
+    # Greedy fit: walk measures in order, assign to staves by note count.
+    # Start from measure 1 (not the first note-bearing measure) to include
+    # rest-only measures at the beginning.
+    staff_measure_ranges: dict[int, tuple[int, int]] = {}
+    si_idx = 0
+    staff_target = notes_per_staff[staff_list[si_idx]]
+    accumulated = 0
+    first_measure_on_staff = 1  # always start from m1
+
+    for m in measure_list:
+        count = notes_per_measure[m]
+        if accumulated + count > staff_target and accumulated > 0 and si_idx + 1 < len(staff_list):
+            # Close current staff
+            staff_measure_ranges[staff_list[si_idx]] = (first_measure_on_staff, m - 1)
+            si_idx += 1
+            staff_target = notes_per_staff[staff_list[si_idx]]
+            accumulated = 0
+            first_measure_on_staff = m
+
+        accumulated += count
+
+    # Close final staff
+    if si_idx < len(staff_list):
+        last_m = measure_list[-1] if measure_list else 1
+        staff_measure_ranges[staff_list[si_idx]] = (first_measure_on_staff, last_m)
+
+    if debug:
+        for si in sorted(staff_measure_ranges.keys()):
+            first, last = staff_measure_ranges[si]
+            print(f"[detect_repeats] Staff {si}: m{first}-m{last}")
+
+    # Build staff lookup for x extent
+    # Use barline positions for staff x range (more precise than staff_info min_x/max_x)
+    staff_x_range: dict[int, tuple[float, float]] = {}
+    for bl in classified:
+        si = bl["staff_idx"]
+        if si not in staff_x_range:
+            staff_x_range[si] = (bl["x"], bl["x"])
+        else:
+            lo, hi = staff_x_range[si]
+            staff_x_range[si] = (min(lo, bl["x"]), max(hi, bl["x"]))
+
+    # For each barline, interpolate its position within the staff's measure range
+    for bl in classified:
+        si = bl["staff_idx"]
+        if si not in staff_measure_ranges or si not in staff_x_range:
+            bl["measure_before"] = None
+            bl["measure_after"] = None
+            continue
+
+        first_m, last_m = staff_measure_ranges[si]
+        x_lo, x_hi = staff_x_range[si]
+        num_measures = last_m - first_m + 1
+        staff_width = x_hi - x_lo
+
+        if staff_width <= 0:
+            bl["measure_before"] = first_m
+            bl["measure_after"] = first_m
+            continue
+
+        # Proportional position: 0.0 = left edge, 1.0 = right edge
+        proportion = (bl["x"] - x_lo) / staff_width
+
+        # Map to nearest measure boundary.
+        # Boundaries: 0 = left edge (before first_m), N = right edge (after last_m)
+        boundary_pos = proportion * num_measures
+        boundary = round(boundary_pos)
+        boundary = max(0, min(num_measures, boundary))
+
+        # Convert boundary to measure numbers
+        m_before = first_m + boundary - 1  # measure to the left
+        m_after = first_m + boundary        # measure to the right
+
+        bl["measure_before"] = m_before if m_before >= first_m else None
+        bl["measure_after"] = m_after if m_after <= last_m else None
+
+    if debug:
+        repeats = [bl for bl in classified if bl["type"] != "normal"]
+        for bl in repeats:
+            print(f"[detect_repeats] {bl['type']} at x={bl['x']:.0f} staff={bl['staff_idx']}: "
+                  f"m_before={bl['measure_before']} m_after={bl['measure_after']}")
+
+
+def _assign_from_barline_count(
+    classified: list[dict],
+    staff_info: list[dict],
+    total_measures: int,
+    debug: bool,
+) -> None:
+    """Fallback: assign measure numbers by counting barlines per staff."""
     staff_barlines: dict[int, list[dict]] = {}
     for bl in classified:
         idx = bl["staff_idx"]
@@ -275,67 +404,33 @@ def _assign_measure_numbers(
             staff_barlines[idx] = []
         staff_barlines[idx].append(bl)
 
-    # Sort by x within each staff
     for idx in staff_barlines:
         staff_barlines[idx].sort(key=lambda b: b["x"])
 
-    # Build staff lookup for unit_size
-    staff_lookup = {s["staff"]: s for s in staff_info}
-
-    # Walk through staves in order, assigning measure numbers.
-    # HOMR produces two boxes for each repeat barline (thick + thin bar).
-    # Only consolidate pairs where BOTH are classified as repeat types —
-    # don't consolidate normal close barlines.
     current_measure = 1
     for staff_idx in sorted(staff_barlines.keys()):
         barlines = staff_barlines[staff_idx]
-        staff = staff_lookup.get(staff_idx)
-        unit = staff["unit_size"] if staff else 20.0
         n = len(barlines)
-
-        # Identify repeat-classified pairs to consolidate
-        boundary_ids = []
-        boundary = 0
-        i = 0
-        while i < n:
-            boundary_ids.append(boundary)
-            # Only consolidate if: close together AND both are repeat types
-            if i + 1 < n:
-                gap = barlines[i + 1]["x"] - barlines[i]["x"]
-                both_repeat = (
-                    barlines[i]["type"] != "normal"
-                    and barlines[i + 1]["type"] != "normal"
-                )
-                if gap < unit * 1.0 and both_repeat:
-                    i += 1
-                    boundary_ids.append(boundary)  # same boundary
-            boundary += 1
-            i += 1
-
-        num_boundaries = boundary
-        measures_on_staff = max(1, num_boundaries - 1)
+        measures_on_staff = max(1, n - 1)
 
         for i, bl in enumerate(barlines):
-            b = boundary_ids[i]
-            if b == 0:
+            if i == 0:
                 bl["measure_before"] = None
                 bl["measure_after"] = current_measure
-            elif b == num_boundaries - 1:
-                bl["measure_before"] = current_measure + b - 1
+            elif i == n - 1:
+                bl["measure_before"] = current_measure + i - 1
                 bl["measure_after"] = None
             else:
-                bl["measure_before"] = current_measure + b - 1
-                bl["measure_after"] = current_measure + b
+                bl["measure_before"] = current_measure + i - 1
+                bl["measure_after"] = current_measure + i
 
         current_measure += measures_on_staff
 
-    inferred_total = current_measure - 1
-    if total_measures > 0 and inferred_total != total_measures:
-        if debug:
-            print(
-                f"[detect_repeats] Inferred {inferred_total} measures "
-                f"(MusicXML says {total_measures})"
-            )
+    if debug:
+        inferred = current_measure - 1
+        if total_measures > 0 and inferred != total_measures:
+            print(f"[detect_repeats] WARNING: inferred {inferred} measures "
+                  f"(MusicXML says {total_measures})")
 
 
 def build_repeat_markers(classified_barlines: list[dict], debug: bool = False) -> list[dict]:
