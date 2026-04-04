@@ -181,9 +181,12 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
     scale_x = orig_w / proc_w
     scale_y = orig_h / proc_h
 
+    from homr.model import Rest
+
     staff_info = []
     barline_info = []
     note_info = []
+    rest_info = []
 
     for ms_idx, multi_staff in enumerate(multi_staffs):
         for s_idx, staff in enumerate(multi_staff.staffs):
@@ -221,10 +224,23 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
                     "height": float(note.box.size[1] * scale_y),
                 })
 
-    print(f"[HOMR] Extracted: {len(staff_info)} staves, "
-          f"{len(barline_info)} barlines, {len(note_info)} notes")
+            # Rests on this staff
+            for symbol in staff.get_all_except_notes():
+                if isinstance(symbol, Rest):
+                    rx, ry = symbol.center
+                    rw, rh = symbol.box.size
+                    rest_info.append({
+                        "staff_idx": staff_idx,
+                        "x": float(rx * scale_x),
+                        "y": float(ry * scale_y),
+                        "width": float(rw * scale_x),
+                        "height": float(rh * scale_y),
+                    })
 
-    return musicxml_path, staff_info, barline_info, note_info
+    print(f"[HOMR] Extracted: {len(staff_info)} staves, "
+          f"{len(barline_info)} barlines, {len(note_info)} notes, {len(rest_info)} rests")
+
+    return musicxml_path, staff_info, barline_info, note_info, rest_info
 
 
 def handler(event):
@@ -250,7 +266,7 @@ def handler(event):
 
         try:
             # Run HOMR via Python API
-            musicxml_path, staff_info, barline_info, note_info = run_homr_api(
+            musicxml_path, staff_info, barline_info, note_info, rest_info = run_homr_api(
                 tmp_path, use_gpu=True
             )
 
@@ -272,11 +288,14 @@ def handler(event):
             homr_repeat_count = len(repeat_markers)
             try:
                 notes_list = parsed.get("notes", [])
+                rests_list = parsed.get("rests", [])
                 classified_barlines = detect_repeat_barlines(
                     tmp_path, barline_info, staff_info,
                     total_measures=total_m,
                     notes=notes_list,
                     note_positions=note_info,
+                    rests=rests_list,
+                    rest_positions=rest_info,
                     debug=True,
                 )
                 custom_markers = build_repeat_markers(classified_barlines, debug=True)
@@ -316,6 +335,7 @@ def handler(event):
             metadata["staves_detected"] = len(staff_info)
             metadata["barlines_detected"] = len(barline_info)
             metadata["notes_with_positions"] = len(note_info)
+            metadata["rests_with_positions"] = len(rest_info)
 
             return {
                 "success": True,
@@ -329,6 +349,7 @@ def handler(event):
                 "staff_positions": staff_info,
                 "barline_positions": barline_info,
                 "note_positions": note_info,
+                "rest_positions": rest_info,
                 "musicxml": musicxml_content,
                 "message": f"HOMR: {len(notes)} notes, {len(rests)} rests, "
                            f"{len(repeat_markers)} repeats, "

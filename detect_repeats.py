@@ -31,6 +31,8 @@ def detect_repeat_barlines(
     total_measures: int = 0,
     notes: list[dict] | None = None,
     note_positions: list[dict] | None = None,
+    rests: list[dict] | None = None,
+    rest_positions: list[dict] | None = None,
     debug: bool = False,
 ) -> list[dict]:
     """
@@ -102,8 +104,8 @@ def detect_repeat_barlines(
                 f"w={bl['width']:.1f} unit={unit:.1f}{edge_tag}"
             )
 
-    # Assign measure numbers using note data (accurate) or barline counting (fallback)
-    _assign_measure_numbers(classified, staff_info, total_measures, notes, note_positions, debug)
+    # Assign measure numbers using note+rest data (accurate) or barline counting (fallback)
+    _assign_measure_numbers(classified, staff_info, total_measures, notes, note_positions, rests, rest_positions, debug)
 
     if debug:
         repeats = [b for b in classified if b["type"] != "normal"]
@@ -262,36 +264,50 @@ def _assign_measure_numbers(
     total_measures: int,
     notes: list[dict] | None,
     note_positions: list[dict] | None,
+    rests: list[dict] | None,
+    rest_positions: list[dict] | None,
     debug: bool,
 ) -> None:
     """
     Assign measure numbers to each barline.
 
-    Primary method: pair MusicXML notes (with measure numbers) with segmentation
-    note positions (with staff_idx and x). For each barline, the nearest note
-    to its right determines which measure starts there.
+    Primary method: combine notes + rests from MusicXML (with measure numbers)
+    and segmentation (with staff_idx). Count elements per measure and per staff,
+    then greedily fit measures to staves.
 
-    Fallback: count barlines per staff if note data is unavailable.
+    Fallback: count barlines per staff if element data is unavailable.
     """
+    # Combine notes and rests into unified element lists
+    all_elements = []  # from MusicXML: each has 'measure'
+    all_positions = []  # from segmentation: each has 'staff_idx', 'x'
+
     if notes and note_positions and len(notes) == len(note_positions):
-        _assign_from_notes(classified, notes, note_positions, debug)
+        all_elements.extend(notes)
+        all_positions.extend(note_positions)
+    if rests and rest_positions and len(rests) == len(rest_positions):
+        all_elements.extend(rests)
+        all_positions.extend(rest_positions)
+
+    if all_elements and all_positions and len(all_elements) == len(all_positions):
+        _assign_from_elements(classified, all_elements, all_positions, debug)
     else:
         if debug:
-            print("[detect_repeats] No note data — falling back to barline counting")
+            print(f"[detect_repeats] Element count mismatch (xml={len(all_elements)} "
+                  f"seg={len(all_positions)}) — falling back to barline counting")
         _assign_from_barline_count(classified, staff_info, total_measures, debug)
 
 
-def _assign_from_notes(
+def _assign_from_elements(
     classified: list[dict],
-    notes: list[dict],
-    note_positions: list[dict],
+    elements: list[dict],
+    positions: list[dict],
     debug: bool,
 ) -> None:
     """
-    Assign measure numbers using note-count fitting.
+    Assign measure numbers using element-count fitting (notes + rests).
 
-    Step 1: Build staff → measure range by greedily fitting MusicXML note
-    counts to segmentation note counts per staff.
+    Step 1: Build staff → measure range by greedily fitting MusicXML element
+    counts (notes + rests) to segmentation position counts per staff.
 
     Step 2: For each barline, interpolate its x position within the staff's
     x extent to determine which measure boundary it's at. This is robust
@@ -300,9 +316,9 @@ def _assign_from_notes(
     from collections import Counter
     import math
 
-    # Count notes per measure (MusicXML) and per staff (segmentation)
-    notes_per_measure = Counter(n["measure"] for n in notes)
-    notes_per_staff = Counter(np["staff_idx"] for np in note_positions)
+    # Count elements per measure (MusicXML) and per staff (segmentation)
+    notes_per_measure = Counter(e["measure"] for e in elements)
+    notes_per_staff = Counter(p["staff_idx"] for p in positions)
 
     measure_list = sorted(notes_per_measure.keys())
     staff_list = sorted(notes_per_staff.keys())
