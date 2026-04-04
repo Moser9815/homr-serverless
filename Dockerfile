@@ -60,5 +60,7 @@ COPY handler.py .
 COPY parse_musicxml.py .
 COPY detect_repeats.py .
 COPY detect_voltas.py .
+COPY clef_classifier.py .
+COPY pitch_from_position.py .
 
 CMD ["python3", "-u", "handler.py"]

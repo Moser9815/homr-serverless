@@ -213,7 +213,7 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
                     "height": float(bh * scale_y),
                 })
 
-            # Notes on this staff
+            # Notes on this staff (include position for geometric pitch)
             for note in staff.get_notes():
                 nx, ny = note.center
                 note_info.append({
@@ -222,6 +222,7 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
                     "y": float(ny * scale_y),
                     "width": float(note.box.size[0] * scale_x),
                     "height": float(note.box.size[1] * scale_y),
+                    "position": note.position,
                 })
 
             # Rests on this staff
@@ -237,10 +238,23 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
                         "height": float(rh * scale_y),
                     })
 
-    print(f"[HOMR] Extracted: {len(staff_info)} staves, "
-          f"{len(barline_info)} barlines, {len(note_info)} notes, {len(rest_info)} rests")
+    # Clef/key symbol bounding boxes (for clef classification)
+    clef_key_info = []
+    for ck_box in symbols.clefs_keys:
+        cx, cy = ck_box.center
+        cw, ch = ck_box.size
+        clef_key_info.append({
+            "x": float(cx * scale_x),
+            "y": float(cy * scale_y),
+            "width": float(cw * scale_x),
+            "height": float(ch * scale_y),
+        })
 
-    return musicxml_path, staff_info, barline_info, note_info, rest_info
+    print(f"[HOMR] Extracted: {len(staff_info)} staves, "
+          f"{len(barline_info)} barlines, {len(note_info)} notes, "
+          f"{len(rest_info)} rests, {len(clef_key_info)} clef/key symbols")
+
+    return musicxml_path, staff_info, barline_info, note_info, rest_info, clef_key_info
 
 
 def handler(event):
@@ -266,7 +280,7 @@ def handler(event):
 
         try:
             # Run HOMR via Python API
-            musicxml_path, staff_info, barline_info, note_info, rest_info = run_homr_api(
+            musicxml_path, staff_info, barline_info, note_info, rest_info, clef_key_info = run_homr_api(
                 tmp_path, use_gpu=True
             )
 
@@ -279,6 +293,69 @@ def handler(event):
                 default_tempo=tempo,
                 default_time_signature=time_signature,
             )
+
+            # Post-process step 0: geometric clef detection + pitch recomputation
+            # HOMR's transformer sometimes gets the clef wrong, which shifts all pitches.
+            # Use note.position (from segmentation) to validate/correct.
+            geometric_clef_status = "skipped"
+            try:
+                from clef_classifier import find_clef_for_staff
+                from pitch_from_position import determine_clef_from_positions, recompute_pitches
+
+                import cv2 as _cv2
+                original_img = _cv2.imread(tmp_path)
+
+                # Classify clef visually from the image
+                visual_clef = None
+                if staff_info and clef_key_info:
+                    visual_clef = find_clef_for_staff(original_img, staff_info[0], clef_key_info)
+                    print(f"[HOMR] Visual clef classification: {visual_clef}")
+
+                # Also determine clef from note positions (geometric)
+                position_clef = determine_clef_from_positions(note_info)
+                print(f"[HOMR] Position-based clef: {position_clef}")
+
+                # Transformer's clef (from MusicXML parsing)
+                transformer_clef = parsed.get("metadata", {}).get("clef", clef)
+                print(f"[HOMR] Transformer clef: {transformer_clef}")
+
+                # Consensus: if visual and position agree, use that.
+                # If they disagree, prefer visual (more distinctive).
+                # If visual unavailable, use position-based.
+                if visual_clef and position_clef:
+                    if visual_clef == position_clef:
+                        determined_clef = visual_clef
+                        geometric_clef_status = f"consensus:{determined_clef}"
+                    else:
+                        determined_clef = visual_clef
+                        geometric_clef_status = f"visual:{visual_clef},position:{position_clef}"
+                elif visual_clef:
+                    determined_clef = visual_clef
+                    geometric_clef_status = f"visual_only:{visual_clef}"
+                elif position_clef:
+                    determined_clef = position_clef
+                    geometric_clef_status = f"position_only:{position_clef}"
+                else:
+                    determined_clef = transformer_clef
+                    geometric_clef_status = "transformer_fallback"
+
+                # If geometric clef disagrees with transformer, recompute pitches
+                if determined_clef != transformer_clef:
+                    print(f"[HOMR] Clef override: {transformer_clef} → {determined_clef}")
+                    fifths_str = parsed.get("metadata", {}).get("fifths", 0)
+                    fifths = int(fifths_str) if fifths_str else 0
+                    parsed["notes"] = recompute_pitches(
+                        parsed["notes"], note_info, determined_clef, fifths
+                    )
+                    parsed["metadata"]["clef"] = determined_clef
+                    parsed["metadata"]["clef_override"] = True
+                    geometric_clef_status += f",recomputed"
+                else:
+                    print(f"[HOMR] Clef confirmed: {determined_clef}")
+
+            except Exception as e:
+                geometric_clef_status = f"error: {e}"
+                traceback.print_exc()
 
             # Post-process step 1: classify barlines as repeat/normal
             # using image-based dot detection (replaces HOMR's unreliable transformer)
@@ -336,6 +413,7 @@ def handler(event):
             metadata["barlines_detected"] = len(barline_info)
             metadata["notes_with_positions"] = len(note_info)
             metadata["rests_with_positions"] = len(rest_info)
+            metadata["geometric_clef"] = geometric_clef_status
 
             return {
                 "success": True,

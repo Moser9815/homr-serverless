@@ -383,6 +383,7 @@ def parse_musicxml_to_json(
     detected_tempo = default_tempo
     detected_time_sig = default_time_signature
     detected_key = "C"
+    detected_fifths = 0
     detected_clef = default_clef
     tempo_detected = False
     time_sig_detected = False
@@ -433,6 +434,7 @@ def parse_musicxml_to_json(
                     fifths_text = find_text(key_el, "fifths")
                     if fifths_text:
                         fifths = int(fifths_text)
+                        detected_fifths = fifths
                         detected_key = FIFTHS_TO_KEY.get(fifths, "C")
 
                 clef_el = find(attributes, "clef")
@@ -592,6 +594,7 @@ def parse_musicxml_to_json(
             "detected_key": detected_key,
             "key_display": key_display,
             "total_measures": total_measures,
+            "fifths": detected_fifths,
             "articulations_detected": articulation_counts if articulation_counts else None,
         },
     }

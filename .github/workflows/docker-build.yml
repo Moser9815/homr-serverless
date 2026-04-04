@@ -9,6 +9,8 @@ on:
       - 'parse_musicxml.py'
       - 'detect_repeats.py'
       - 'detect_voltas.py'
+      - 'clef_classifier.py'
+      - 'pitch_from_position.py'
       - 'requirements.txt'
   workflow_dispatch:
 
