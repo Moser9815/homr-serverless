@@ -354,50 +354,78 @@ def _assign_from_elements(
             first, last = staff_measure_ranges[si]
             print(f"[detect_repeats] Staff {si}: m{first}-m{last}")
 
-    # Build staff lookup for x extent
-    # Use barline positions for staff x range (more precise than staff_info min_x/max_x)
-    staff_x_range: dict[int, tuple[float, float]] = {}
-    for bl in classified:
-        si = bl["staff_idx"]
-        if si not in staff_x_range:
-            staff_x_range[si] = (bl["x"], bl["x"])
-        else:
-            lo, hi = staff_x_range[si]
-            staff_x_range[si] = (min(lo, bl["x"]), max(hi, bl["x"]))
+    # Build per-staff measure x-ranges from actual element positions.
+    # Within each staff, assign positions to measures in left-to-right order
+    # using the MusicXML element counts per measure.
+    staff_positions: dict[int, list[float]] = {}
+    for p in positions:
+        si = p["staff_idx"]
+        if si not in staff_positions:
+            staff_positions[si] = []
+        staff_positions[si].append(p["x"])
 
-    # For each barline, interpolate its position within the staff's measure range
+    for si in staff_positions:
+        staff_positions[si].sort()
+
+    # For each staff, walk through positions and assign to measures
+    # to find the x-range of each measure.
+    measure_x_ranges: dict[int, tuple[float, float]] = {}  # measure → (min_x, max_x)
+    for si in sorted(staff_measure_ranges.keys()):
+        first_m, last_m = staff_measure_ranges[si]
+        pos_list = staff_positions.get(si, [])
+        pos_idx = 0
+
+        for m in range(first_m, last_m + 1):
+            count = notes_per_measure.get(m, 0)
+            if count == 0:
+                continue
+            # Take the next 'count' positions for this measure
+            end_idx = min(pos_idx + count, len(pos_list))
+            if pos_idx < end_idx:
+                xs = pos_list[pos_idx:end_idx]
+                measure_x_ranges[m] = (min(xs), max(xs))
+            pos_idx = end_idx
+
+    # Compute measure midpoints for boundary detection
+    # Sort measures on each staff by their x midpoint
+    staff_measure_midpoints: dict[int, list[tuple[float, int]]] = {}
+    for si in sorted(staff_measure_ranges.keys()):
+        first_m, last_m = staff_measure_ranges[si]
+        midpoints = []
+        for m in range(first_m, last_m + 1):
+            if m in measure_x_ranges:
+                lo, hi = measure_x_ranges[m]
+                midpoints.append(((lo + hi) / 2, m))
+        midpoints.sort()
+        staff_measure_midpoints[si] = midpoints
+
+    # For each barline, find which two measures it falls between
     for bl in classified:
         si = bl["staff_idx"]
-        if si not in staff_measure_ranges or si not in staff_x_range:
+        midpoints = staff_measure_midpoints.get(si, [])
+
+        if not midpoints:
             bl["measure_before"] = None
             bl["measure_after"] = None
             continue
 
-        first_m, last_m = staff_measure_ranges[si]
-        x_lo, x_hi = staff_x_range[si]
-        num_measures = last_m - first_m + 1
-        staff_width = x_hi - x_lo
+        bx = bl["x"]
 
-        if staff_width <= 0:
-            bl["measure_before"] = first_m
-            bl["measure_after"] = first_m
-            continue
+        # Find the last measure whose midpoint is to the left of the barline
+        m_before = None
+        m_after = None
+        for i, (mx, m) in enumerate(midpoints):
+            if mx > bx:
+                m_after = m
+                if i > 0:
+                    m_before = midpoints[i - 1][1]
+                break
+        else:
+            # Barline is past all midpoints — it's after the last measure
+            m_before = midpoints[-1][1]
 
-        # Proportional position: 0.0 = left edge, 1.0 = right edge
-        proportion = (bl["x"] - x_lo) / staff_width
-
-        # Map to nearest measure boundary.
-        # Boundaries: 0 = left edge (before first_m), N = right edge (after last_m)
-        boundary_pos = proportion * num_measures
-        boundary = round(boundary_pos)
-        boundary = max(0, min(num_measures, boundary))
-
-        # Convert boundary to measure numbers
-        m_before = first_m + boundary - 1  # measure to the left
-        m_after = first_m + boundary        # measure to the right
-
-        bl["measure_before"] = m_before if m_before >= first_m else None
-        bl["measure_after"] = m_after if m_after <= last_m else None
+        bl["measure_before"] = m_before
+        bl["measure_after"] = m_after
 
     if debug:
         repeats = [bl for bl in classified if bl["type"] != "normal"]
