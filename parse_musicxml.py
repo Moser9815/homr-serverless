@@ -43,6 +43,79 @@ def pitch_name_from_midi(midi: int) -> str:
     return f"{NOTE_NAMES[midi % 12]}{(midi // 12) - 1}"
 
 
+def pitch_name_from_step_alter(step: str, octave: int, alter: int = 0) -> str:
+    """Build pitch name preserving enharmonic spelling from MusicXML.
+
+    Unlike pitch_name_from_midi, this keeps Bb as 'Bb' not 'A#'.
+    """
+    accidental = ""
+    if alter == 1:
+        accidental = "#"
+    elif alter == -1:
+        accidental = "b"
+    elif alter == 2:
+        accidental = "##"
+    elif alter == -2:
+        accidental = "bb"
+    return f"{step}{accidental}{octave}"
+
+
+def _infer_clef_from_notes(notes: list[dict]) -> str | None:
+    """Infer clef from median MIDI pitch of detected notes."""
+    pitches = [n["pitch"] for n in notes if "pitch" in n]
+    if not pitches:
+        return None
+    median = sorted(pitches)[len(pitches) // 2]
+    # Bass clef center: D3 = MIDI 50, Treble center: B4 = MIDI 71
+    if median < 57:
+        return "bass"
+    elif median < 65:
+        return "alto"
+    else:
+        return "treble"
+
+
+def _infer_key_from_accidentals(step_alter_counts: dict[str, dict[int, int]]) -> str | None:
+    """Infer key signature from step+alter patterns across all notes.
+
+    step_alter_counts: {step: {alter: count}}
+    e.g. {"F": {1: 45, 0: 2}, "C": {1: 30}} → 2 sharps → "D"
+    """
+    # Sharp order (circle of fifths): F C G D A E B
+    sharp_order = ["F", "C", "G", "D", "A", "E", "B"]
+    fifths = 0
+    for step in sharp_order:
+        if step not in step_alter_counts:
+            break
+        sharp_count = step_alter_counts[step].get(1, 0)
+        natural_count = step_alter_counts[step].get(0, 0)
+        if sharp_count > natural_count and sharp_count >= 2:
+            fifths += 1
+        else:
+            break
+
+    if fifths > 0:
+        return FIFTHS_TO_KEY.get(fifths)
+
+    # Flat order: B E A D G C F
+    flat_order = ["B", "E", "A", "D", "G", "C", "F"]
+    flats = 0
+    for step in flat_order:
+        if step not in step_alter_counts:
+            break
+        flat_count = step_alter_counts[step].get(-1, 0)
+        natural_count = step_alter_counts[step].get(0, 0)
+        if flat_count > natural_count and flat_count >= 2:
+            flats += 1
+        else:
+            break
+
+    if flats > 0:
+        return FIFTHS_TO_KEY.get(-flats)
+
+    return "C"
+
+
 def duration_type_name(type_text: str, dots: int = 0) -> str:
     base_map = {
         "whole": "whole",
@@ -268,6 +341,8 @@ def parse_musicxml_to_json(
 
     # Track articulation counts for metadata
     articulation_counts = {}
+    # Track step+alter patterns for key inference
+    step_alter_counts: dict[str, dict[int, int]] = {}
 
     for part in parts:
         measures = findall(part, "measure")
@@ -366,7 +441,11 @@ def parse_musicxml_to_json(
                         alter = int(float(alter_text)) if alter_text else 0
 
                         midi = midi_pitch(step, octave, alter)
-                        p_name = pitch_name_from_midi(midi)
+                        p_name = pitch_name_from_step_alter(step, octave, alter)
+
+                        # Track step+alter for key inference
+                        step_alter_counts.setdefault(step, {})
+                        step_alter_counts[step][alter] = step_alter_counts[step].get(alter, 0) + 1
 
                         # Check for grace note
                         is_grace = find(note_el, "grace") is not None
@@ -426,6 +505,17 @@ def parse_musicxml_to_json(
 
         # Only process first part
         break
+
+    # Override MusicXML metadata with values inferred from actual notes.
+    # HOMR's MusicXML attributes are often wrong (e.g. treble for bass clef,
+    # C major for D major) even when the note pitches are correct.
+    inferred_clef = _infer_clef_from_notes(notes_out)
+    if inferred_clef and inferred_clef != detected_clef:
+        detected_clef = inferred_clef
+
+    inferred_key = _infer_key_from_accidentals(step_alter_counts)
+    if inferred_key and inferred_key != detected_key:
+        detected_key = inferred_key
 
     key_display = detected_key
     if detected_key in FIFTHS_TO_KEY.values():
