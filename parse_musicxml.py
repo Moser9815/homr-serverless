@@ -571,6 +571,9 @@ def parse_musicxml_to_json(
     inferred_key = _infer_key_from_accidentals(step_alter_counts)
     if inferred_key and inferred_key != detected_key:
         detected_key = inferred_key
+        # Update fifths to match the inferred key
+        key_to_fifths = {v: k for k, v in FIFTHS_TO_KEY.items()}
+        detected_fifths = key_to_fifths.get(inferred_key, 0)
 
     if not time_sig_detected:
         inferred_ts = _infer_time_signature(notes_out, rests_out)
