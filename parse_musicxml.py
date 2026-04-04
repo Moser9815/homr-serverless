@@ -116,6 +116,59 @@ def _infer_key_from_accidentals(step_alter_counts: dict[str, dict[int, int]]) ->
     return "C"
 
 
+def _infer_time_signature(notes: list[dict], rests: list[dict]) -> str | None:
+    """Infer time signature from total beat content per measure.
+
+    Counts the sum of note/rest durations per measure and takes the most
+    common total. Skips the first and last measures (often incomplete).
+    """
+    from collections import Counter
+
+    measure_beats: dict[int, float] = {}
+    for item in notes + rests:
+        m = item.get("measure", 0)
+        # Use duration_beats for rests, compute from duration_type for notes
+        dur = item.get("duration_beats", 0)
+        if dur == 0:
+            dur_type = item.get("duration_type", "quarter")
+            # Strip "dotted-" prefix for lookup
+            base_type = dur_type.replace("dotted-", "")
+            type_map = {"whole": 4.0, "half": 2.0, "quarter": 1.0, "eighth": 0.5,
+                        "sixteenth": 0.25, "thirtySecond": 0.125}
+            dur = type_map.get(base_type, 1.0)
+            if "dotted" in dur_type:
+                dur *= 1.5
+        measure_beats[m] = measure_beats.get(m, 0) + dur
+
+    if len(measure_beats) < 3:
+        return None
+
+    # Skip first and last measures (often pickup/incomplete)
+    measures = sorted(measure_beats.keys())
+    inner = [measure_beats[m] for m in measures[1:-1]]
+    if not inner:
+        return None
+
+    # Round to nearest 0.5 and find the mode
+    rounded = [round(b * 2) / 2 for b in inner]
+    most_common = Counter(rounded).most_common(1)[0][0]
+
+    # Map to standard time signatures
+    beats = most_common
+    if abs(beats - 4.0) < 0.5:
+        return "4/4"
+    elif abs(beats - 3.0) < 0.5:
+        return "3/4"
+    elif abs(beats - 2.0) < 0.5:
+        return "2/4"
+    elif abs(beats - 6.0) < 0.5:
+        return "6/8"
+    elif abs(beats - 1.5) < 0.25:
+        return "3/8"
+    else:
+        return f"{int(beats)}/4"
+
+
 def duration_type_name(type_text: str, dots: int = 0) -> str:
     base_map = {
         "whole": "whole",
@@ -516,6 +569,11 @@ def parse_musicxml_to_json(
     inferred_key = _infer_key_from_accidentals(step_alter_counts)
     if inferred_key and inferred_key != detected_key:
         detected_key = inferred_key
+
+    if not time_sig_detected:
+        inferred_ts = _infer_time_signature(notes_out, rests_out)
+        if inferred_ts:
+            detected_time_sig = inferred_ts
 
     key_display = detected_key
     if detected_key in FIFTHS_TO_KEY.values():
