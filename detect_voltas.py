@@ -107,15 +107,12 @@ def detect_voltas(
             )
             if voltas:
                 num_voltas = max(v for iters in voltas.values() for v in iters)
-                # Extend end_measure to include volta 2+ measures (which are
-                # AFTER the backward repeat barline). The RepeatExpander only
-                # collects notes in startMeasure...endMeasure, so the right-side
-                # volta measures must be inside that range.
-                effective_end = max(int(m) for m in voltas.keys())
                 # repeat_count=1 means "play twice total" in iOS model.
                 # N voltas = N total plays = repeat_count of N-1.
+                # end_measure stays at the backward repeat barline (for visual
+                # rendering). The app's RepeatExpander handles volta 2 measures
+                # beyond end_measure by checking voltaEndings.
                 result[idx] = dict(rm,
-                    end_measure=max(rm["end_measure"], effective_end),
                     volta_endings=voltas,
                     repeat_count=num_voltas - 1,
                 )
