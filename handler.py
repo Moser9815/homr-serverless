@@ -296,50 +296,46 @@ def handler(event):
 
             # Post-process step 0: geometric clef detection + pitch recomputation
             # HOMR's transformer sometimes gets the clef wrong, which shifts all pitches.
-            # Use note.position (from segmentation) to validate/correct.
+            # Use visual analysis of the clef region to validate/correct.
+            # Only override when we have HIGH confidence — avoid false positives.
             geometric_clef_status = "skipped"
             try:
                 from clef_classifier import find_clef_for_staff
-                from pitch_from_position import determine_clef_from_positions, recompute_pitches
+                from pitch_from_position import recompute_pitches
 
                 import cv2 as _cv2
                 original_img = _cv2.imread(tmp_path)
 
-                # Classify clef visually from the image
+                # Classify clef visually from the image (returns clef + confidence)
                 visual_clef = None
-                if staff_info and clef_key_info:
-                    visual_clef = find_clef_for_staff(original_img, staff_info[0], clef_key_info)
-                    print(f"[HOMR] Visual clef classification: {visual_clef}")
-
-                # Also determine clef from note positions (geometric)
-                position_clef = determine_clef_from_positions(note_info)
-                print(f"[HOMR] Position-based clef: {position_clef}")
+                visual_confidence = 0.0
+                if staff_info:
+                    visual_clef, visual_confidence = find_clef_for_staff(
+                        original_img, staff_info[0], clef_key_info
+                    )
+                    print(f"[HOMR] Visual clef: {visual_clef} (confidence: {visual_confidence:.2f})")
 
                 # Transformer's clef (from MusicXML parsing)
                 transformer_clef = parsed.get("metadata", {}).get("clef", clef)
                 print(f"[HOMR] Transformer clef: {transformer_clef}")
 
-                # Consensus: if visual and position agree, use that.
-                # If they disagree, prefer visual (more distinctive).
-                # If visual unavailable, use position-based.
-                if visual_clef and position_clef:
-                    if visual_clef == position_clef:
-                        determined_clef = visual_clef
-                        geometric_clef_status = f"consensus:{determined_clef}"
-                    else:
-                        determined_clef = visual_clef
-                        geometric_clef_status = f"visual:{visual_clef},position:{position_clef}"
-                elif visual_clef:
-                    determined_clef = visual_clef
-                    geometric_clef_status = f"visual_only:{visual_clef}"
-                elif position_clef:
-                    determined_clef = position_clef
-                    geometric_clef_status = f"position_only:{position_clef}"
-                else:
-                    determined_clef = transformer_clef
-                    geometric_clef_status = "transformer_fallback"
+                # Decision logic:
+                # - Only override transformer when visual confidence is HIGH (>0.7)
+                #   AND visual disagrees with transformer.
+                # - Low confidence = defer to transformer (avoid false positives).
+                determined_clef = transformer_clef
 
-                # If geometric clef disagrees with transformer, recompute pitches
+                if visual_clef and visual_clef != transformer_clef and visual_confidence >= 0.7:
+                    determined_clef = visual_clef
+                    geometric_clef_status = f"override:{visual_clef}(conf={visual_confidence:.2f}),was:{transformer_clef}"
+                elif visual_clef and visual_clef == transformer_clef:
+                    geometric_clef_status = f"confirmed:{visual_clef}(conf={visual_confidence:.2f})"
+                elif visual_clef and visual_confidence < 0.7:
+                    geometric_clef_status = f"low_conf:{visual_clef}(conf={visual_confidence:.2f}),keeping:{transformer_clef}"
+                else:
+                    geometric_clef_status = f"no_visual,keeping:{transformer_clef}"
+
+                # If overriding, recompute pitches from note positions
                 if determined_clef != transformer_clef:
                     print(f"[HOMR] Clef override: {transformer_clef} → {determined_clef}")
                     fifths_str = parsed.get("metadata", {}).get("fifths", 0)
