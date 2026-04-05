@@ -104,18 +104,20 @@ def classify_clef_from_image(
 def find_clef_for_staff(
     image: np.ndarray,
     staff_info: dict,
-    clef_key_boxes: list[dict],
+    clef_key_boxes: list[dict] | None = None,
 ) -> str:
     """
     Find and classify the clef for a specific staff.
 
-    The clef is the leftmost clefs_keys symbol within the staff's
-    vertical range, positioned near the left edge of the staff.
+    Uses two strategies:
+    1. If clef_key_boxes are detected, find the leftmost one on this staff
+    2. If no boxes detected, crop the left edge of the staff image directly
+       (the clef symbol is always at the far left)
 
     Args:
         image: Original image
         staff_info: Staff position dict with min_x, max_x, min_y, max_y, unit_size
-        clef_key_boxes: All detected clef/key bounding boxes
+        clef_key_boxes: All detected clef/key bounding boxes (may be empty)
 
     Returns:
         "treble", "bass", or "alto"
@@ -126,33 +128,115 @@ def find_clef_for_staff(
     staff_height = staff_max_y - staff_min_y
     staff_width = staff_info["max_x"] - staff_min_x
 
-    # Find clef/key boxes within this staff's vertical range
-    # and near the left edge (first 20% of staff width)
-    candidates = []
-    margin_y = staff_height * 0.5  # Allow some vertical overshoot
-    left_cutoff = staff_min_x + staff_width * 0.2
+    # Strategy 1: Use detected clef/key boxes
+    if clef_key_boxes:
+        candidates = []
+        margin_y = staff_height * 0.5
+        left_cutoff = staff_min_x + staff_width * 0.2
 
-    for box in clef_key_boxes:
-        bx = box.get("x", 0)
-        by = box.get("y", 0)
-        bh = box.get("height", 0)
+        for box in clef_key_boxes:
+            bx = box.get("x", 0)
+            by = box.get("y", 0)
+            bh = box.get("height", 0)
 
-        # Check vertical overlap with staff
-        box_top = by - bh / 2
-        box_bot = by + bh / 2
-        if box_bot < staff_min_y - margin_y or box_top > staff_max_y + margin_y:
-            continue
+            box_top = by - bh / 2
+            box_bot = by + bh / 2
+            if box_bot < staff_min_y - margin_y or box_top > staff_max_y + margin_y:
+                continue
+            if bx > left_cutoff:
+                continue
+            candidates.append(box)
 
-        # Check horizontal position (near left edge)
-        if bx > left_cutoff:
-            continue
+        if candidates:
+            clef_box = min(candidates, key=lambda b: b.get("x", 0))
+            return classify_clef_from_image(image, clef_box, staff_info)
 
-        candidates.append(box)
+    # Strategy 2: Crop the left edge of the staff image directly
+    # The clef symbol occupies roughly the leftmost 12% of the staff width
+    return _classify_clef_from_staff_edge(image, staff_info)
 
-    if not candidates:
-        return "treble"  # Default
 
-    # Pick the leftmost candidate (that's the clef; key sig is to its right)
-    clef_box = min(candidates, key=lambda b: b.get("x", 0))
+def _classify_clef_from_staff_edge(
+    image: np.ndarray,
+    staff_info: dict,
+) -> str:
+    """
+    Classify clef by analyzing the left edge of the staff image.
 
-    return classify_clef_from_image(image, clef_box, staff_info)
+    Treble clefs (G clef) extend well above and below the staff lines.
+    Bass clefs (F clef) stay mostly within the staff area.
+    """
+    staff_min_x = staff_info["min_x"]
+    staff_min_y = staff_info["min_y"]
+    staff_max_y = staff_info["max_y"]
+    staff_height = staff_max_y - staff_min_y
+    staff_width = staff_info["max_x"] - staff_min_x
+    unit_size = staff_info.get("unit_size", staff_height / 4)
+
+    # Crop the clef region: left 12% of staff, with vertical margin
+    margin = staff_height * 0.6  # Allow for treble clef extending above/below
+    x1 = max(0, int(staff_min_x))
+    x2 = min(image.shape[1], int(staff_min_x + staff_width * 0.12))
+    y1 = max(0, int(staff_min_y - margin))
+    y2 = min(image.shape[0], int(staff_max_y + margin))
+
+    if x2 <= x1 or y2 <= y1:
+        return "treble"
+
+    region = image[y1:y2, x1:x2]
+
+    # Convert to grayscale and binarize
+    if len(region.shape) == 3:
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = region
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Measure vertical extent of ink in the clef region
+    # Project horizontally: sum of black pixels per row
+    row_sums = np.sum(binary > 0, axis=1)
+    threshold = binary.shape[1] * 0.05  # At least 5% of width has ink
+
+    ink_rows = np.where(row_sums > threshold)[0]
+    if len(ink_rows) == 0:
+        return "treble"
+
+    ink_top = ink_rows[0]
+    ink_bottom = ink_rows[-1]
+    ink_height = ink_bottom - ink_top
+
+    # Staff position in the cropped region
+    staff_top_in_crop = int(staff_min_y - y1)
+    staff_bot_in_crop = int(staff_max_y - y1)
+
+    # How much does the ink extend above and below the staff?
+    above_staff = max(0, staff_top_in_crop - ink_top)
+    below_staff = max(0, ink_bottom - staff_bot_in_crop)
+    total_extension = above_staff + below_staff
+
+    # Treble clef: extends significantly above AND below staff (total > 0.8 * staff_height)
+    # Bass clef: stays mostly within staff bounds (total < 0.3 * staff_height)
+    extension_ratio = total_extension / max(staff_height, 1)
+
+    if extension_ratio > 0.6:
+        return "treble"
+    elif extension_ratio < 0.3:
+        return "bass"
+
+    # Ambiguous — check if more extension is above (treble) or below (bass)
+    if above_staff > below_staff * 1.5:
+        return "treble"
+    elif below_staff > above_staff * 1.5:
+        return "bass"
+
+    # Still ambiguous — analyze ink density in upper vs lower half
+    mid = (staff_top_in_crop + staff_bot_in_crop) // 2
+    upper_ink = np.sum(binary[:mid, :] > 0)
+    lower_ink = np.sum(binary[mid:, :] > 0)
+
+    if upper_ink > lower_ink * 1.3:
+        return "treble"  # Treble clef has more ink above center (the spiral)
+    elif lower_ink > upper_ink * 1.3:
+        return "bass"
+
+    return "treble"  # Default
