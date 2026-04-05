@@ -269,7 +269,7 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
           f"{len(barline_info)} barlines, {len(note_info)} notes, "
           f"{len(rest_info)} rests, {len(clef_key_info)} clef/key symbols")
 
-    return musicxml_path, staff_info, barline_info, note_info, rest_info, clef_key_info, dewarped_staff0
+    return musicxml_path, staff_info, barline_info, note_info, rest_info, clef_key_info, dewarped_staff0, dewarp_error
 
 
 def handler(event):
@@ -295,7 +295,7 @@ def handler(event):
 
         try:
             # Run HOMR via Python API
-            musicxml_path, staff_info, barline_info, note_info, rest_info, clef_key_info, dewarped_staff0 = run_homr_api(
+            musicxml_path, staff_info, barline_info, note_info, rest_info, clef_key_info, dewarped_staff0, dewarp_error = run_homr_api(
                 tmp_path, use_gpu=True
             )
 
@@ -427,6 +427,8 @@ def handler(event):
             metadata["rests_with_positions"] = len(rest_info)
             metadata["geometric_clef"] = geometric_clef_status
             metadata["dewarped_available"] = dewarped_staff0 is not None
+            if dewarp_error:
+                metadata["dewarp_error"] = dewarp_error
 
             return {
                 "success": True,
