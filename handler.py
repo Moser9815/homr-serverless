@@ -150,6 +150,7 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
 
     # Step 7b: Dewarp staff 0 for clef classification (before transformer)
     dewarped_staff0 = None
+    dewarp_error = None
     try:
         from homr.staff_parsing import prepare_staff_image
         from homr.staff_regions import StaffRegions
@@ -158,7 +159,9 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
         dewarped_staff0, _ = prepare_staff_image(debug, 0, first_staff, predictions.preprocessed, regions)
         print(f"[HOMR] Dewarped staff 0: {dewarped_staff0.shape}")
     except Exception as e:
+        dewarp_error = str(e)
         print(f"[HOMR] Dewarp failed: {e}")
+        traceback.print_exc()
 
     # Step 8: Transformer (symbol recognition → MusicXML)
     transformer_config = TransformerConfig()
@@ -423,6 +426,8 @@ def handler(event):
             metadata["notes_with_positions"] = len(note_info)
             metadata["rests_with_positions"] = len(rest_info)
             metadata["geometric_clef"] = geometric_clef_status
+            if dewarp_error:
+                metadata["dewarp_error"] = dewarp_error
 
             return {
                 "success": True,
