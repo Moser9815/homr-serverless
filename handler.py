@@ -148,6 +148,18 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
     print(f"[HOMR] Staff detection: {elapsed_detect:.1f}s, "
           f"{len(staffs)} staves, {barlines_assigned} barlines, {len(notes)} notes")
 
+    # Step 7b: Dewarp staff 0 for clef classification (before transformer)
+    dewarped_staff0 = None
+    try:
+        from homr.staff_parsing import prepare_staff_image
+        from homr.staff_regions import StaffRegions
+        regions = StaffRegions(multi_staffs)
+        first_staff = multi_staffs[0].staffs[0]
+        dewarped_staff0, _ = prepare_staff_image(debug, 0, first_staff, predictions.preprocessed, regions)
+        print(f"[HOMR] Dewarped staff 0: {dewarped_staff0.shape}")
+    except Exception as e:
+        print(f"[HOMR] Dewarp failed: {e}")
+
     # Step 8: Transformer (symbol recognition → MusicXML)
     transformer_config = TransformerConfig()
     transformer_config.use_gpu_inference = use_gpu
@@ -254,7 +266,7 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
           f"{len(barline_info)} barlines, {len(note_info)} notes, "
           f"{len(rest_info)} rests, {len(clef_key_info)} clef/key symbols")
 
-    return musicxml_path, staff_info, barline_info, note_info, rest_info, clef_key_info
+    return musicxml_path, staff_info, barline_info, note_info, rest_info, clef_key_info, dewarped_staff0
 
 
 def handler(event):
@@ -280,7 +292,7 @@ def handler(event):
 
         try:
             # Run HOMR via Python API
-            musicxml_path, staff_info, barline_info, note_info, rest_info, clef_key_info = run_homr_api(
+            musicxml_path, staff_info, barline_info, note_info, rest_info, clef_key_info, dewarped_staff0 = run_homr_api(
                 tmp_path, use_gpu=True
             )
 
@@ -306,12 +318,13 @@ def handler(event):
                 import cv2 as _cv2
                 original_img = _cv2.imread(tmp_path)
 
-                # Classify clef visually from the image (returns clef + confidence)
+                # Classify clef from dewarped staff 0 image
                 visual_clef = None
                 visual_confidence = 0.0
                 if staff_info:
                     visual_clef, visual_confidence = find_clef_for_staff(
-                        original_img, staff_info[0], clef_key_info
+                        original_img, staff_info[0], clef_key_info,
+                        dewarped_staff=dewarped_staff0,
                     )
                     print(f"[HOMR] Visual clef: {visual_clef} (confidence: {visual_confidence:.2f})")
 
