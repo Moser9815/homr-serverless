@@ -426,8 +426,7 @@ def handler(event):
             metadata["notes_with_positions"] = len(note_info)
             metadata["rests_with_positions"] = len(rest_info)
             metadata["geometric_clef"] = geometric_clef_status
-            if dewarp_error:
-                metadata["dewarp_error"] = dewarp_error
+            metadata["dewarped_available"] = dewarped_staff0 is not None
 
             return {
                 "success": True,
