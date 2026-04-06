@@ -44,5 +44,6 @@ jobs:
           context: .
           push: true
           tags: moser9815/homr-serverless:latest
+          no-cache: true
           provenance: false
           sbom: false

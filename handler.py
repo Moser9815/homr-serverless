@@ -7,6 +7,8 @@ and note pixel positions from the segmentation pipeline.
 This code is licensed under AGPL-3.0 to comply with HOMR's license.
 """
 
+HANDLER_VERSION = "2.0-bug4-chords"
+
 import base64
 import io
 import os
@@ -419,6 +421,7 @@ def handler(event):
             metadata = parsed.get("metadata", {})
             metadata["processing_time"] = round(processing_time, 2)
             metadata["detection_method"] = "homr"
+            metadata["handler_version"] = HANDLER_VERSION
             metadata["repeat_detection"] = repeat_status
             metadata["volta_detection"] = volta_status
             metadata["staves_detected"] = len(staff_info)
