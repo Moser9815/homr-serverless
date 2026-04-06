@@ -395,6 +395,7 @@ def parse_musicxml_to_json(
 
     # Track articulation counts for metadata
     articulation_counts = {}
+    staff_clefs = {}  # {staff_number: clef_name} from <clef number="N">
     # Track step+alter patterns for key inference
     step_alter_counts: dict[str, dict[int, int]] = {}
 
@@ -413,8 +414,7 @@ def parse_musicxml_to_json(
             total_measures = max(total_measures, measure_number)
             current_beat = 1.0
 
-            attributes = find(measure, "attributes")
-            if attributes is not None:
+            for attributes in findall(measure, "attributes"):
                 div_el = find(attributes, "divisions")
                 if div_el is not None and div_el.text:
                     divisions = int(div_el.text)
@@ -437,15 +437,15 @@ def parse_musicxml_to_json(
                         detected_fifths = fifths
                         detected_key = FIFTHS_TO_KEY.get(fifths, "C")
 
-                clef_el = find(attributes, "clef")
-                if clef_el is not None:
+                for clef_el in findall(attributes, "clef"):
                     sign = find_text(clef_el, "sign", "G")
-                    if sign == "G":
-                        detected_clef = "treble"
-                    elif sign == "F":
-                        detected_clef = "bass"
-                    elif sign == "C":
-                        detected_clef = "alto"
+                    clef_name = {"G": "treble", "F": "bass", "C": "alto"}.get(sign, "treble")
+                    clef_num = clef_el.get("number", "1")
+                    # Only capture initial clefs (first occurrence per staff)
+                    if int(clef_num) not in staff_clefs:
+                        staff_clefs[int(clef_num)] = clef_name
+                    if clef_num == "1" and detected_clef == default_clef:
+                        detected_clef = clef_name
 
             for direction in findall(measure, "direction"):
                 sound = find(direction, "sound")
@@ -455,108 +455,142 @@ def parse_musicxml_to_json(
 
             seconds_per_beat = 60.0 / detected_tempo
 
-            for note_el in findall(measure, "note"):
-                is_chord = find(note_el, "chord") is not None
+            # Process ALL measure children in document order.
+            # This is critical: <backup> and <forward> elements must be
+            # interleaved with <note> elements to correctly handle
+            # multi-voice timing. Processing them in separate loops
+            # (Bug #4) causes simultaneous voices to be serialized.
+            chord_beat = current_beat  # beat of last non-chord note (for <chord/> notes)
+            chord_time = current_time
+            for child in measure:
+                tag = child.tag
+                if "}" in tag:
+                    tag = tag.split("}")[-1]
 
-                type_el = find(note_el, "type")
-                type_text = type_el.text if type_el is not None and type_el.text else "quarter"
+                if tag == "note":
+                    note_el = child
+                    is_chord = find(note_el, "chord") is not None
 
-                dots = len(findall(note_el, "dot"))
+                    type_el = find(note_el, "type")
+                    type_text = type_el.text if type_el is not None and type_el.text else "quarter"
 
-                dur_beats = duration_beats(type_text, dots)
-                dur_seconds = dur_beats * seconds_per_beat
+                    dots = len(findall(note_el, "dot"))
 
-                # Extract articulations
-                arts = _extract_articulations(note_el, ns)
-                for a in arts:
-                    articulation_counts[a] = articulation_counts.get(a, 0) + 1
+                    dur_beats = duration_beats(type_text, dots)
+                    dur_seconds = dur_beats * seconds_per_beat
 
-                is_rest = find(note_el, "rest") is not None
+                    # Extract articulations
+                    arts = _extract_articulations(note_el, ns)
+                    for a in arts:
+                        articulation_counts[a] = articulation_counts.get(a, 0) + 1
 
-                if is_rest:
-                    rest_entry = {
-                        "duration_type": duration_type_name(type_text, dots),
-                        "duration_beats": dur_beats,
-                        "measure": measure_number,
-                        "beat": round(current_beat, 4),
-                        "start_time": round(current_time, 4),
-                        "end_time": round(current_time + dur_seconds, 4),
-                        "duration": round(dur_seconds, 4),
-                    }
-                    # Include articulations on rests too (e.g., fermata on rest)
-                    if arts:
-                        rest_entry["articulations"] = arts
-                    rests_out.append(rest_entry)
-                else:
-                    pitch_el = find(note_el, "pitch")
-                    if pitch_el is not None:
-                        step = find_text(pitch_el, "step", "C")
-                        octave = int(find_text(pitch_el, "octave", "4"))
-                        alter_text = find_text(pitch_el, "alter", "0")
-                        alter = int(float(alter_text)) if alter_text else 0
+                    # Extract voice and staff
+                    voice_el = find(note_el, "voice")
+                    note_voice = int(voice_el.text) if voice_el is not None and voice_el.text else 1
+                    staff_el = find(note_el, "staff")
+                    note_staff = int(staff_el.text) if staff_el is not None and staff_el.text else 1
 
-                        midi = midi_pitch(step, octave, alter)
-                        p_name = pitch_name_from_step_alter(step, octave, alter)
+                    # Chord notes use the beat/time of the previous non-chord note
+                    if is_chord:
+                        note_beat = chord_beat
+                        note_time = chord_time
+                    else:
+                        note_beat = current_beat
+                        note_time = current_time
+                        chord_beat = current_beat
+                        chord_time = current_time
 
-                        # Track step+alter for key inference
-                        step_alter_counts.setdefault(step, {})
-                        step_alter_counts[step][alter] = step_alter_counts[step].get(alter, 0) + 1
+                    is_rest = find(note_el, "rest") is not None
 
-                        # Check for grace note
-                        is_grace = find(note_el, "grace") is not None
-
-                        # Grace notes get near-zero duration so they don't
-                        # overlap the principal note in the playback schedule
-                        if is_grace:
-                            grace_dur = 0.05
-                            note_entry = {
-                                "pitch": midi,
-                                "pitch_name": p_name,
-                                "start_time": round(current_time, 4),
-                                "end_time": round(current_time + grace_dur, 4),
-                                "duration": grace_dur,
-                                "duration_type": duration_type_name(type_text, dots),
-                                "beat": round(current_beat, 4),
-                                "measure": measure_number,
-                                "confidence": 0.9,
-                                "is_grace": True,
-                            }
-                        else:
-                            note_entry = {
-                                "pitch": midi,
-                                "pitch_name": p_name,
-                                "start_time": round(current_time, 4),
-                                "end_time": round(current_time + dur_seconds, 4),
-                                "duration": round(dur_seconds, 4),
-                                "duration_type": duration_type_name(type_text, dots),
-                                "beat": round(current_beat, 4),
-                                "measure": measure_number,
-                                "confidence": 0.9,
-                            }
+                    if is_rest:
+                        rest_entry = {
+                            "duration_type": duration_type_name(type_text, dots),
+                            "duration_beats": dur_beats,
+                            "measure": measure_number,
+                            "beat": round(note_beat, 4),
+                            "start_time": round(note_time, 4),
+                            "end_time": round(note_time + dur_seconds, 4),
+                            "duration": round(dur_seconds, 4),
+                            "voice": note_voice,
+                            "staff": note_staff,
+                        }
                         if arts:
-                            note_entry["articulations"] = arts
+                            rest_entry["articulations"] = arts
+                        rests_out.append(rest_entry)
+                    else:
+                        pitch_el = find(note_el, "pitch")
+                        if pitch_el is not None:
+                            step = find_text(pitch_el, "step", "C")
+                            octave = int(find_text(pitch_el, "octave", "4"))
+                            alter_text = find_text(pitch_el, "alter", "0")
+                            alter = int(float(alter_text)) if alter_text else 0
 
-                        notes_out.append(note_entry)
+                            midi = midi_pitch(step, octave, alter)
+                            p_name = pitch_name_from_step_alter(step, octave, alter)
 
-                if not is_chord:
-                    # Grace notes don't advance time
-                    if find(note_el, "grace") is None:
-                        current_time += dur_seconds
-                        current_beat += dur_beats
+                            step_alter_counts.setdefault(step, {})
+                            step_alter_counts[step][alter] = step_alter_counts[step].get(alter, 0) + 1
 
-            for forward in findall(measure, "forward"):
-                dur_el = find(forward, "duration")
-                if dur_el is not None and dur_el.text:
-                    fwd_beats = int(dur_el.text) / divisions
-                    current_time += fwd_beats * seconds_per_beat
-                    current_beat += fwd_beats
+                            is_grace = find(note_el, "grace") is not None
 
-            for backup in findall(measure, "backup"):
-                dur_el = find(backup, "duration")
-                if dur_el is not None and dur_el.text:
-                    bk_beats = int(dur_el.text) / divisions
-                    current_time -= bk_beats * seconds_per_beat
-                    current_beat -= bk_beats
+                            if is_grace:
+                                grace_dur = 0.05
+                                note_entry = {
+                                    "pitch": midi,
+                                    "pitch_name": p_name,
+                                    "start_time": round(note_time, 4),
+                                    "end_time": round(note_time + grace_dur, 4),
+                                    "duration": grace_dur,
+                                    "duration_type": duration_type_name(type_text, dots),
+                                    "beat": round(note_beat, 4),
+                                    "measure": measure_number,
+                                    "confidence": 0.9,
+                                    "is_grace": True,
+                                    "voice": note_voice,
+                                    "staff": note_staff,
+                                }
+                            else:
+                                note_entry = {
+                                    "pitch": midi,
+                                    "pitch_name": p_name,
+                                    "start_time": round(note_time, 4),
+                                    "end_time": round(note_time + dur_seconds, 4),
+                                    "duration": round(dur_seconds, 4),
+                                    "duration_type": duration_type_name(type_text, dots),
+                                    "beat": round(note_beat, 4),
+                                    "measure": measure_number,
+                                    "confidence": 0.9,
+                                    "voice": note_voice,
+                                    "staff": note_staff,
+                                }
+                            if arts:
+                                note_entry["articulations"] = arts
+
+                            notes_out.append(note_entry)
+
+                    if not is_chord:
+                        if find(note_el, "grace") is None:
+                            current_time += dur_seconds
+                            current_beat += dur_beats
+
+                elif tag == "forward":
+                    dur_el = find(child, "duration")
+                    if dur_el is not None and dur_el.text:
+                        fwd_beats = int(dur_el.text) / divisions
+                        current_time += fwd_beats * seconds_per_beat
+                        current_beat += fwd_beats
+
+                elif tag == "backup":
+                    dur_el = find(child, "duration")
+                    if dur_el is not None and dur_el.text:
+                        bk_beats = int(dur_el.text) / divisions
+                        current_time -= bk_beats * seconds_per_beat
+                        current_beat -= bk_beats
+                        # Clamp to measure start (beat 1.0, time = measure start)
+                        if current_beat < 1.0:
+                            current_beat = 1.0
+                        if current_time < 0:
+                            current_time = max(0, current_time)
 
         # Only process first part
         break
@@ -564,9 +598,12 @@ def parse_musicxml_to_json(
     # Override MusicXML metadata with values inferred from actual notes.
     # HOMR's MusicXML attributes are often wrong (e.g. treble for bass clef,
     # C major for D major) even when the note pitches are correct.
-    inferred_clef = _infer_clef_from_notes(notes_out)
-    if inferred_clef and inferred_clef != detected_clef:
-        detected_clef = inferred_clef
+    # For grand staff, trust the MusicXML per-staff clefs.
+    # Only infer clef for single-staff pieces where HOMR's transformer may be wrong.
+    if len(staff_clefs) <= 1:
+        inferred_clef = _infer_clef_from_notes(notes_out)
+        if inferred_clef and inferred_clef != detected_clef:
+            detected_clef = inferred_clef
 
     inferred_key = _infer_key_from_accidentals(step_alter_counts)
     if inferred_key and inferred_key != detected_key:
@@ -599,5 +636,8 @@ def parse_musicxml_to_json(
             "total_measures": total_measures,
             "fifths": detected_fifths,
             "articulations_detected": articulation_counts if articulation_counts else None,
+            "num_staves": max(staff_clefs.keys()) if staff_clefs else 1,
+            "is_grand_staff": len(staff_clefs) > 1,
+            "staff_clefs": {str(k): v for k, v in staff_clefs.items()} if staff_clefs else None,
         },
     }
