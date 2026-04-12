@@ -447,7 +447,7 @@ def handler(event):
                         )
                         geo_midi, geo_name = position_to_midi(int(pos), clef, fifths_val)
                         t_midi = pn.get("pitch", 0)
-                        if abs(t_midi - geo_midi) > 12:
+                        if abs(t_midi - geo_midi) > 4:
                             pn["pitch"] = geo_midi
                             pn["pitch_name"] = geo_name
                             correction_count += 1
