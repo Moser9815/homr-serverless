@@ -395,36 +395,15 @@ def handler(event):
                 default_time_signature=time_signature,
             )
 
-            # Geometric pitch resolution with confidence — bypasses HOMR's
-            # unreliable transformer pitches for notes where HOMR's segmentation
-            # position disagrees. See pitch_from_position.py for the confidence
-            # scoring table.
-            try:
-                from pitch_from_position import recompute_pitches_with_confidence
-                clef_changes_list = parsed.get("metadata", {}).get("clef_changes") or []
-                staff_clefs_default = parsed.get("metadata", {}).get("staff_clefs") or {}
-                # staff_clefs keys are strings ("1", "2"); convert to ints
-                staff_clefs_default_int = {int(k): v for k, v in staff_clefs_default.items()}
-                fifths_raw = parsed.get("metadata", {}).get("fifths", 0)
-                fifths = int(fifths_raw) if fifths_raw else 0
-                parsed["notes"] = recompute_pitches_with_confidence(
-                    parsed["notes"],
-                    homr_buckets,
-                    clef_changes_list,
-                    fifths=fifths,
-                    staff_clefs_default=staff_clefs_default_int,
-                )
-                # Stats for logging AND response metadata
-                from collections import Counter
-                src_counts = Counter(n.get("pitch_source", "transformer") for n in parsed["notes"])
-                bucket_counts = {f"{s}_{m}": len(v) for (s, m), v in sorted(homr_buckets.items())}
-                parsed["metadata"]["pitch_resolution_sources"] = dict(src_counts)
-                parsed["metadata"]["homr_bucket_counts"] = bucket_counts
-                print(f"[HOMR] Geometric pitch resolution: {dict(src_counts)}")
-                print(f"[HOMR] HOMR buckets ({len(homr_buckets)}): {bucket_counts}")
-            except Exception as e:
-                print(f"[HOMR] Geometric pitch resolution failed: {e}")
-                traceback.print_exc()
+            # Geometric pitch resolution — HIBERNATED.
+            # The infrastructure exists (pitch_from_position.py) but the
+            # current pairing strategy is fragile (phantoms, chord ordering,
+            # cursor drift). HOMR's transformer is correct for ~95% of notes;
+            # only bottom-staff m13-16 is wrong on Drift Away, likely due to
+            # merged grand-staff dewarping. Re-enable once HOMR's transformer-
+            # to-position reconciliation is solved at the source.
+            # See PLAN.md and HANDOFF.md for investigation findings.
+            parsed["metadata"]["geometric_pitch"] = "hibernated"
 
             # Post-process step 0: geometric clef detection + pitch recomputation
             # HOMR's transformer sometimes gets the clef wrong, which shifts all pitches.
