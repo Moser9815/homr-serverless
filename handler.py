@@ -209,6 +209,17 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
         for s_idx, staff in enumerate(multi_staff.staffs):
             staff_idx = len(staff_info)
 
+            # Actual fitted staff-line geometry (5 y-values per x sample).
+            # This is what HOMR's own teaser uses — handles warped / curved
+            # staves, unlike synthesized minY + i*unitSize.
+            grid_points = []
+            for point in staff.grid:
+                if len(point.y) == 5:
+                    grid_points.append({
+                        "x": float(point.x * scale_x),
+                        "ys": [float(y * scale_y) for y in point.y],
+                    })
+
             staff_info.append({
                 "staff": staff_idx,
                 "min_x": float(staff.min_x * scale_x),
@@ -216,6 +227,7 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
                 "min_y": float(staff.min_y * scale_y),
                 "max_y": float(staff.max_y * scale_y),
                 "unit_size": float(staff.average_unit_size * scale_y),
+                "line_grid": grid_points,
             })
 
             # Barlines on this staff
