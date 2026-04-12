@@ -224,14 +224,37 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple:
 
         for s_idx, staff in enumerate(multi_staff.staffs):
             staff_idx = len(staff_info)
-            # Grand-staff staff number: 1 for top, 2 for bottom. iOS and
-            # MusicXML use this convention.
-            staff_number_1or2 = s_idx + 1
+            # For a merged grand staff (`is_grandstaff == True`), the Staff's
+            # grid has 10 y-values per column: lines 0-4 = top physical
+            # staff, 5-9 = bottom. Notes from BOTH physical staves live in
+            # the merged staff's symbols. For a non-merged (single) staff,
+            # `s_idx + 1` is the staff number directly.
+            is_grand = getattr(staff, "is_grandstaff", False)
 
             # Bucket this staff's notes into global measures using the
-            # system's barline x-positions.
+            # system's barline x-positions AND classify each note as
+            # belonging to the top or bottom physical staff by comparing
+            # its y to the grid's line positions.
             for note in sorted(staff.get_notes(), key=lambda n: n.center[0]):
                 nx_proc = note.center[0]
+                ny_proc = note.center[1]
+
+                # Determine staff_number_1or2 for this note.
+                if is_grand:
+                    grid_point = staff.get_at(nx_proc)
+                    if grid_point is None and staff.grid:
+                        grid_point = min(staff.grid, key=lambda p: abs(p.x - nx_proc))
+                    if grid_point is not None and len(grid_point.y) >= 10:
+                        # Midpoint between bottom line of top staff (idx 4)
+                        # and top line of bottom staff (idx 5).
+                        mid_y = (grid_point.y[4] + grid_point.y[5]) / 2.0
+                        staff_number_1or2 = 1 if ny_proc < mid_y else 2
+                    else:
+                        # Fallback: single-staff or missing grid → default top
+                        staff_number_1or2 = 1
+                else:
+                    staff_number_1or2 = s_idx + 1
+
                 bucket_idx = 0
                 for bx in system_barline_xs:
                     if nx_proc > bx:
