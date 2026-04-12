@@ -41,7 +41,7 @@ def decode_image(base64_data: str) -> Image.Image:
     return img
 
 
-def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict], list[dict], list[dict]]:
+def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple:
     """
     Run HOMR via Python API, capturing barline and note pixel positions
     that the standard pipeline discards.
@@ -205,9 +205,47 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
     note_info = []
     rest_info = []
 
+    # homr_buckets keys each parsed note's HOMR Note by (staff_number,
+    # measure_number) where staff_number = 1 (top of grand staff) or 2
+    # (bottom) to match MusicXML <staff>, and measure_number is the global
+    # measure index across all systems. Each bucket's list is in x-order.
+    # Used later for geometric pitch resolution with confidence.
+    homr_buckets: dict = {}
+    running_measure = 1
+
     for ms_idx, multi_staff in enumerate(multi_staffs):
+        # Use the top staff's barlines for measure bucketing (grand-staff
+        # barlines span both physical staves).
+        top_staff_for_barlines = multi_staff.staffs[0]
+        system_barline_xs = sorted(
+            b.box.center[0] for b in top_staff_for_barlines.get_bar_lines()
+        )
+        num_measures_in_system = max(len(system_barline_xs), 1)
+
         for s_idx, staff in enumerate(multi_staff.staffs):
             staff_idx = len(staff_info)
+            # Grand-staff staff number: 1 for top, 2 for bottom. iOS and
+            # MusicXML use this convention.
+            staff_number_1or2 = s_idx + 1
+
+            # Bucket this staff's notes into global measures using the
+            # system's barline x-positions.
+            for note in sorted(staff.get_notes(), key=lambda n: n.center[0]):
+                nx_proc = note.center[0]
+                bucket_idx = 0
+                for bx in system_barline_xs:
+                    if nx_proc > bx:
+                        bucket_idx += 1
+                    else:
+                        break
+                global_measure = running_measure + bucket_idx
+                homr_buckets.setdefault(
+                    (staff_number_1or2, global_measure), []
+                ).append({
+                    "position": int(note.position),
+                    "x": float(note.center[0] * scale_x),
+                    "y": float(note.center[1] * scale_y),
+                })
 
             # Actual fitted staff-line geometry — same data HOMR's own teaser
             # uses. Each StaffPoint has 5, 10, 15... y-values (multi-staff
@@ -268,6 +306,10 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
                         "height": float(rh * scale_y),
                     })
 
+        # Advance global measure counter by the number of measures in this
+        # system so the next system's buckets land on the right global #.
+        running_measure += num_measures_in_system
+
     # Clef/key symbol bounding boxes (for clef classification)
     clef_key_info = []
     for ck_box in symbols.clefs_keys:
@@ -282,9 +324,11 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple[str, list[dict]
 
     print(f"[HOMR] Extracted: {len(staff_info)} staves, "
           f"{len(barline_info)} barlines, {len(note_info)} notes, "
-          f"{len(rest_info)} rests, {len(clef_key_info)} clef/key symbols")
+          f"{len(rest_info)} rests, {len(clef_key_info)} clef/key symbols, "
+          f"{len(homr_buckets)} measure-buckets for pitch resolution")
 
-    return musicxml_path, staff_info, barline_info, note_info, rest_info, clef_key_info, dewarped_staff0, dewarp_error
+    return (musicxml_path, staff_info, barline_info, note_info, rest_info,
+            clef_key_info, dewarped_staff0, dewarp_error, homr_buckets)
 
 
 def handler(event):
@@ -310,9 +354,9 @@ def handler(event):
 
         try:
             # Run HOMR via Python API
-            musicxml_path, staff_info, barline_info, note_info, rest_info, clef_key_info, dewarped_staff0, dewarp_error = run_homr_api(
-                tmp_path, use_gpu=True
-            )
+            (musicxml_path, staff_info, barline_info, note_info, rest_info,
+             clef_key_info, dewarped_staff0, dewarp_error,
+             homr_buckets) = run_homr_api(tmp_path, use_gpu=True)
 
             with open(musicxml_path, "r", encoding="utf-8") as f:
                 musicxml_content = f.read()
@@ -323,6 +367,33 @@ def handler(event):
                 default_tempo=tempo,
                 default_time_signature=time_signature,
             )
+
+            # Geometric pitch resolution with confidence — bypasses HOMR's
+            # unreliable transformer pitches for notes where HOMR's segmentation
+            # position disagrees. See pitch_from_position.py for the confidence
+            # scoring table.
+            try:
+                from pitch_from_position import recompute_pitches_with_confidence
+                clef_changes_list = parsed.get("metadata", {}).get("clef_changes") or []
+                staff_clefs_default = parsed.get("metadata", {}).get("staff_clefs") or {}
+                # staff_clefs keys are strings ("1", "2"); convert to ints
+                staff_clefs_default_int = {int(k): v for k, v in staff_clefs_default.items()}
+                fifths_raw = parsed.get("metadata", {}).get("fifths", 0)
+                fifths = int(fifths_raw) if fifths_raw else 0
+                parsed["notes"] = recompute_pitches_with_confidence(
+                    parsed["notes"],
+                    homr_buckets,
+                    clef_changes_list,
+                    fifths=fifths,
+                    staff_clefs_default=staff_clefs_default_int,
+                )
+                # Stats for logging
+                from collections import Counter
+                src_counts = Counter(n.get("pitch_source", "transformer") for n in parsed["notes"])
+                print(f"[HOMR] Geometric pitch resolution: {dict(src_counts)}")
+            except Exception as e:
+                print(f"[HOMR] Geometric pitch resolution failed: {e}")
+                traceback.print_exc()
 
             # Post-process step 0: geometric clef detection + pitch recomputation
             # HOMR's transformer sometimes gets the clef wrong, which shifts all pitches.

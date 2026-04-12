@@ -34,9 +34,14 @@ CLEF_REF = {
     # Bass: bottom line (pos 1) = G2, so pos 0 = F2
     # F is index 3, octave 2
     "bass": (3, 2),
-    # Alto: bottom line (pos 1) = F3, so pos 0 = E3
-    # E is index 2, octave 3
+    # Alto (C clef line 3): middle line = C4, bottom line = F3,
+    # so pos 0 (space below bottom) = E3. E is index 2, octave 3.
     "alto": (2, 3),
+    # Tenor (C clef line 4): middle line = C4 only if we're talking
+    # line 4 from bottom. Tenor has C4 on 4th line, so lines bottom-to-top:
+    # D3 F3 A3 C4 E4 → bottom line (pos 1) = D3, pos 0 = C3.
+    # C is index 0, octave 3.
+    "tenor": (0, 3),
 }
 
 # Key signature: sharps/flats applied to specific notes
@@ -131,6 +136,193 @@ def recompute_pitches(
             note["pitch"] = midi
             note["pitch_name"] = name
             note["pitch_source"] = "geometric"
+
+    return notes
+
+
+def _effective_clef_at(clef_changes: list[dict], staff: int, measure: int, default: str) -> str:
+    """Walk clef_changes and return the most recent clef <= (staff, measure)."""
+    current = default
+    for change in clef_changes:
+        if change["staff"] == staff and change["measure"] <= measure:
+            current = change["clef"]
+    return current
+
+
+def _diatonic_pitch(position: int, clef: str) -> tuple[int, int]:
+    """Return (total_diatonic_idx, midi_without_accidental) for a position+clef.
+
+    This gives the diatonic skeleton — accidentals from key sig or
+    per-note `alter` are applied separately.
+    """
+    ref_note_idx, ref_octave = CLEF_REF.get(clef, CLEF_REF["treble"])
+    total_idx = ref_note_idx + position
+    if total_idx >= 0:
+        octave = ref_octave + total_idx // 7
+        note_within = total_idx % 7
+    else:
+        octave = ref_octave + (total_idx - 6) // 7
+        note_within = total_idx % 7
+    midi = (octave + 1) * 12 + DIATONIC_SEMITONES[note_within]
+    return note_within, midi
+
+
+def _score_confidence(t_midi: int, g_midi: int) -> tuple[float, int, str]:
+    """Compare transformer and geometric MIDI values. Return (confidence,
+    chosen_midi, reason). Lower confidence → geometric wins."""
+    if t_midi == g_midi:
+        return (1.0, t_midi, "exact")
+    # Same pitch class (octave error)
+    if t_midi % 12 == g_midi % 12:
+        return (0.8, g_midi, "octave_off")
+    diff = abs(t_midi - g_midi)
+    if diff <= 2:
+        return (0.5, g_midi, "step_error")
+    if diff <= 5:
+        return (0.3, g_midi, "medium_error")
+    return (0.2, g_midi, "hallucination")
+
+
+def recompute_pitches_with_confidence(
+    notes: list[dict],
+    homr_staff_buckets: dict,
+    clef_changes: list[dict],
+    fifths: int = 0,
+    staff_clefs_default: dict | None = None,
+) -> list[dict]:
+    """Second-pass pitch resolution.
+
+    For each parsed note, compute a geometric pitch from HOMR's
+    per-note `position` + the effective clef for its (staff, measure).
+    Compare against the transformer's pitch. Choose the final pitch
+    based on a confidence score. Emit the confidence + both candidates
+    alongside the chosen pitch.
+
+    Args:
+        notes: parsed notes (mutated in place; also returned)
+        homr_staff_buckets: dict keyed (staff_number, measure_number)
+            → list of HomrNote objects in x-order. The HomrNote objects
+            must expose `.position` (int) and, optionally, `.center[1]`
+            (y pixel) for chord sorting.
+        clef_changes: ordered list of {staff, measure, clef} entries
+            (from parse_musicxml metadata.clef_changes).
+        fifths: key signature (ignored for now — we use per-note `alter`
+            from transformer to preserve accidentals).
+        staff_clefs_default: {staff: clef_name} initial clef fallback.
+
+    Returns:
+        The same notes list with these fields added per note:
+            pitch_transformer (int) — original
+            pitch_geometric (int | None) — may be None if no match
+            pitch_confidence (float 0-1)
+            pitch_source ("transformer" | "geometric" | "fallback")
+            pitch (int) — final chosen value
+    """
+    if staff_clefs_default is None:
+        staff_clefs_default = {}
+
+    # --- Step 1: sanity check measure alignment per staff ---
+    from collections import defaultdict
+    parsed_count: dict = defaultdict(lambda: defaultdict(int))  # [staff][measure] -> count
+    for n in notes:
+        s = n.get("staff") or 1
+        m = n.get("measure") or 1
+        parsed_count[s][m] += 1
+
+    homr_count: dict = defaultdict(lambda: defaultdict(int))
+    for (s, m), bucket in homr_staff_buckets.items():
+        homr_count[s][m] = len(bucket)
+
+    # A staff is trustworthy if every measure matches on count.
+    staff_trusted: dict[int, bool] = {}
+    mismatches_per_staff: dict[int, list] = defaultdict(list)
+    for s in set(list(parsed_count.keys()) + list(homr_count.keys())):
+        trusted = True
+        all_measures = set(parsed_count[s].keys()) | set(homr_count[s].keys())
+        for m in sorted(all_measures):
+            if parsed_count[s][m] != homr_count[s][m]:
+                trusted = False
+                mismatches_per_staff[s].append(
+                    f"m{m}: parsed={parsed_count[s][m]} homr={homr_count[s][m]}"
+                )
+        staff_trusted[s] = trusted
+        if not trusted:
+            print(f"[pitch_from_position] staff {s} measure alignment mismatch, "
+                  f"degrading confidence: {mismatches_per_staff[s][:5]}")
+
+    # --- Step 2: walk notes, override pitch where safe ---
+    # Track idx_in_measure per (staff, measure) as we iterate.
+    idx_counter: dict = defaultdict(int)
+    # Per (staff, measure) chord grouping: build in-place mapping of
+    # HOMR bucket sort-keys vs parsed note sort-keys for same-beat groups.
+    # Simple approach first: iterate linearly, matching by ordinal position
+    # within the bucket. Chord handling is a follow-up.
+
+    for note in notes:
+        s = note.get("staff") or 1
+        m = note.get("measure") or 1
+        t_midi = int(note.get("pitch") or 0)
+        alter = 0  # transformer's alter is already baked into pitch; diff
+                   # comparison below is MIDI-to-MIDI so accidentals survive.
+
+        note["pitch_transformer"] = t_midi
+        note["pitch_geometric"] = None
+        note["pitch_confidence"] = 1.0
+        note["pitch_source"] = "transformer"
+
+        if not staff_trusted.get(s, False):
+            # Untrusted staff — keep transformer pitch, confidence 0.5
+            note["pitch_confidence"] = 0.5
+            note["pitch_source"] = "untrusted_staff"
+            continue
+
+        bucket = homr_staff_buckets.get((s, m)) or []
+        idx = idx_counter[(s, m)]
+        idx_counter[(s, m)] += 1
+
+        if idx >= len(bucket):
+            # Ran out of HOMR notes for this measure — no geometric pitch
+            note["pitch_confidence"] = 0.5
+            note["pitch_source"] = "no_homr_match"
+            continue
+
+        homr_note = bucket[idx]
+        position = homr_note.get("position") if isinstance(homr_note, dict) else getattr(homr_note, "position", None)
+        if position is None:
+            note["pitch_confidence"] = 0.5
+            note["pitch_source"] = "no_position"
+            continue
+
+        effective_clef = _effective_clef_at(
+            clef_changes, s, m,
+            default=staff_clefs_default.get(s, "treble"),
+        )
+
+        # Compute geometric MIDI, preserving transformer's accidental if any.
+        _, geo_midi = _diatonic_pitch(int(position), effective_clef)
+        # Preserve accidentals: if the transformer's pitch differs from the
+        # geometric diatonic pitch by ±1 semitone AND they agree on octave,
+        # the transformer likely has an accidental we should keep.
+        # Otherwise use the raw geometric pitch.
+        diatonic_diff = t_midi - geo_midi
+        if diatonic_diff in (-1, 1) and abs(t_midi - geo_midi) <= 1:
+            # Preserve transformer's accidental by adding it onto geometric
+            geo_midi_with_accidental = t_midi
+        else:
+            geo_midi_with_accidental = geo_midi
+
+        confidence, chosen, reason = _score_confidence(t_midi, geo_midi_with_accidental)
+
+        note["pitch_geometric"] = geo_midi
+        note["pitch_confidence"] = confidence
+        if confidence < 1.0:
+            note["pitch"] = chosen
+            note["pitch_source"] = f"geometric:{reason}"
+            # Recompute pitch_name from new MIDI
+            octave_new = (chosen // 12) - 1
+            semitone = chosen % 12
+            sharps = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+            note["pitch_name"] = f"{sharps[semitone]}{octave_new}"
 
     return notes
 
