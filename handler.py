@@ -166,65 +166,19 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple:
         traceback.print_exc()
 
     # Step 8: Transformer (symbol recognition → MusicXML)
-    # For grand staves, HOMR normally merges two physical staves into one
-    # and feeds the combined image to the transformer. This causes pitch
-    # errors on the bottom staff because the transformer processes both
-    # staves in a single 256px canvas and loses precision on the lower half.
-    #
-    # Fix: create UNMERGED MultiStaff objects that pair the two physical
-    # staves without merging them. parse_staffs then processes each
-    # physical staff independently through the transformer, with its own
-    # dewarp. The result is more accurate pitches because each transformer
-    # run sees a single 5-line staff — the same format HOMR handles well
-    # for single-staff pieces.
+    # NOTE: Option 1 (split grand staves before transformer) was attempted
+    # but the transformer produces fundamentally different output when staves
+    # are separated — 131 notes vs 208 with merged staves. The pipeline
+    # expects merged grand staves; splitting requires deeper changes to
+    # region computation, voice handling, and MusicXML generation.
+    # Keeping merged processing + targeted pitch correction (threshold=7).
     transformer_config = TransformerConfig()
     transformer_config.use_gpu_inference = use_gpu
 
-    # Check if we have grand staves (merged). If so, create unmerged
-    # versions for the transformer while keeping the merged multi_staffs
-    # for note position extraction later.
-    has_grand = any(
-        len(ms.staffs) == 1 and getattr(ms.staffs[0], 'is_grandstaff', False)
-        for ms in multi_staffs
+    result_staffs = parse_staffs(
+        debug, multi_staffs, predictions.preprocessed,
+        selected_staff=-1, config=transformer_config,
     )
-
-    if has_grand and len(staffs) >= 2:
-        # Build unmerged MultiStaffs: pair consecutive individual staves
-        # (from step 4, before merge). Staves are y-sorted, so pairs are
-        # (0,1), (2,3), etc. — matching the grand-staff grouping.
-        unmerged_multi = []
-        i = 0
-        for ms in multi_staffs:
-            if len(ms.staffs) == 1 and getattr(ms.staffs[0], 'is_grandstaff', False):
-                # This was a merged grand staff — use 2 individual staves.
-                # Mark both as is_grandstaff so parse_staff_tromr doesn't
-                # filter out "lower" position notes.
-                if i + 1 < len(staffs):
-                    staffs[i].is_grandstaff = True
-                    staffs[i + 1].is_grandstaff = True
-                    unmerged_multi.append(MultiStaff([staffs[i], staffs[i + 1]], ms.connections))
-                    i += 2
-                else:
-                    unmerged_multi.append(MultiStaff([staffs[i]], []))
-                    i += 1
-            else:
-                # Single staff — keep as-is
-                n_staves_in_ms = len(ms.staffs)
-                unmerged_multi.append(ms)
-                i += n_staves_in_ms
-
-        print(f"[HOMR] Split grand staves: {len(multi_staffs)} merged → "
-              f"{len(unmerged_multi)} unmerged ({sum(len(m.staffs) for m in unmerged_multi)} voices)")
-
-        result_staffs = parse_staffs(
-            debug, unmerged_multi, predictions.preprocessed,
-            selected_staff=-1, config=transformer_config,
-        )
-    else:
-        result_staffs = parse_staffs(
-            debug, multi_staffs, predictions.preprocessed,
-            selected_staff=-1, config=transformer_config,
-        )
 
     title = ""
     try:
