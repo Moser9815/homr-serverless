@@ -395,7 +395,9 @@ def parse_musicxml_to_json(
 
     # Track articulation counts for metadata
     articulation_counts = {}
-    staff_clefs = {}  # {staff_number: clef_name} from <clef number="N">
+    staff_clefs = {}  # {staff_number: clef_name} — initial clef per staff
+    clef_changes = []  # [{staff, measure, clef}] — every clef change including initial
+    current_clef_by_staff: dict[int, str] = {}  # running state for change detection
     # Track step+alter patterns for key inference
     step_alter_counts: dict[str, dict[int, int]] = {}
 
@@ -439,12 +441,38 @@ def parse_musicxml_to_json(
 
                 for clef_el in findall(attributes, "clef"):
                     sign = find_text(clef_el, "sign", "G")
-                    clef_name = {"G": "treble", "F": "bass", "C": "alto"}.get(sign, "treble")
-                    clef_num = clef_el.get("number", "1")
-                    # Only capture initial clefs (first occurrence per staff)
-                    if int(clef_num) not in staff_clefs:
-                        staff_clefs[int(clef_num)] = clef_name
-                    if clef_num == "1" and detected_clef == default_clef:
+                    line_text = find_text(clef_el, "line", "")
+                    # G,2 = treble; F,4 = bass; C,3 = alto; C,4 = tenor
+                    if sign == "G":
+                        clef_name = "treble"
+                    elif sign == "F":
+                        clef_name = "bass"
+                    elif sign == "C":
+                        clef_name = "tenor" if line_text == "4" else "alto"
+                    else:
+                        clef_name = "treble"
+                    clef_num = int(clef_el.get("number", "1"))
+
+                    # Initial clef per staff (for back-compat `staff_clefs`)
+                    if clef_num not in staff_clefs:
+                        staff_clefs[clef_num] = clef_name
+                        detected_clef_flag = True
+                    else:
+                        detected_clef_flag = False
+
+                    # Full history of clef changes — emit on FIRST occurrence
+                    # per staff AND whenever the clef differs from the running
+                    # state. Mid-piece changes (e.g. Drift Away m9 top staff
+                    # switches from treble to bass) end up here.
+                    if current_clef_by_staff.get(clef_num) != clef_name:
+                        clef_changes.append({
+                            "staff": clef_num,
+                            "measure": measure_number,
+                            "clef": clef_name,
+                        })
+                        current_clef_by_staff[clef_num] = clef_name
+
+                    if clef_num == 1 and detected_clef == default_clef:
                         detected_clef = clef_name
 
             for direction in findall(measure, "direction"):
@@ -639,5 +667,6 @@ def parse_musicxml_to_json(
             "num_staves": max(staff_clefs.keys()) if staff_clefs else 1,
             "is_grand_staff": len(staff_clefs) > 1,
             "staff_clefs": {str(k): v for k, v in staff_clefs.items()} if staff_clefs else None,
+            "clef_changes": clef_changes if clef_changes else None,
         },
     }
