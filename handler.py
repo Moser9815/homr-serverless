@@ -395,15 +395,91 @@ def handler(event):
                 default_time_signature=time_signature,
             )
 
-            # Geometric pitch resolution — HIBERNATED.
-            # The infrastructure exists (pitch_from_position.py) but the
-            # current pairing strategy is fragile (phantoms, chord ordering,
-            # cursor drift). HOMR's transformer is correct for ~95% of notes;
-            # only bottom-staff m13-16 is wrong on Drift Away, likely due to
-            # merged grand-staff dewarping. Re-enable once HOMR's transformer-
-            # to-position reconciliation is solved at the source.
-            # See PLAN.md and HANDOFF.md for investigation findings.
-            parsed["metadata"]["geometric_pitch"] = "hibernated"
+            # Targeted pitch correction: only override transformer pitches
+            # that are wildly wrong (> 12 semitones from geometric position).
+            # HOMR's transformer is correct for ~95% of notes — this catches
+            # the ~5% where it hallucinates (e.g., D1 instead of D3 on bass).
+            # Uses per-system sequential zip with parsed-count-guided bucketing
+            # to correlate transformer notes with HOMR segmentation positions.
+            correction_count = 0
+            try:
+                from pitch_from_position import position_to_midi, _effective_clef_at
+                clef_changes_list = parsed.get("metadata", {}).get("clef_changes") or []
+                staff_clefs_map = parsed.get("metadata", {}).get("staff_clefs") or {}
+                fifths_raw = parsed.get("metadata", {}).get("fifths", 0)
+                fifths_val = int(fifths_raw) if fifths_raw else 0
+
+                # System → measure range (derived from barline distribution)
+                # Each staff_info entry = one grand-staff system
+                sys_ranges = []
+                running_m = 1
+                for si in range(len(staff_info)):
+                    top_barlines = [b for b in barline_info if b['staff_idx'] == si]
+                    n_meas = max(len(top_barlines), 1)
+                    sys_ranges.append((running_m, running_m + n_meas - 1))
+                    running_m += n_meas
+
+                # Fallback: use parsed total_measures to cap
+                total_m = parsed.get("metadata", {}).get("total_measures", 0)
+
+                for si, (m_start, m_end) in enumerate(sys_ranges):
+                    if si >= len(staff_info):
+                        break
+                    sp = staff_info[si]
+                    lg = sp.get("line_grid", [])
+                    if not lg or len(lg) < 2:
+                        continue
+                    mid_g = lg[len(lg)//2]
+                    ys_vals = mid_g.get("ys", [])
+                    if len(ys_vals) < 10:
+                        continue  # Not a grand staff
+
+                    mid_y_val = (ys_vals[4] + ys_vals[5]) / 2.0
+
+                    # Split this system's HOMR notes by physical staff
+                    sys_note_pos = sorted(
+                        [p for p in note_info if p.get("staff_idx") == si],
+                        key=lambda n: (n["x"], n["y"])
+                    )
+                    for phys_staff in [1, 2]:
+                        if phys_staff == 1:
+                            homr_chunk = [n for n in sys_note_pos if n["y"] < mid_y_val]
+                        else:
+                            homr_chunk = [n for n in sys_note_pos if n["y"] >= mid_y_val]
+
+                        # Parsed notes for this system + staff
+                        parsed_chunk = [
+                            n for n in parsed["notes"]
+                            if (n.get("staff") or 1) == phys_staff
+                            and m_start <= n.get("measure", 0) <= m_end
+                        ]
+
+                        # Sequential zip, override only when diff > 12
+                        for i in range(min(len(parsed_chunk), len(homr_chunk))):
+                            pn = parsed_chunk[i]
+                            hn = homr_chunk[i]
+                            pos = hn.get("position")
+                            if pos is None:
+                                continue
+                            m = pn.get("measure", 1)
+                            clef = _effective_clef_at(
+                                clef_changes_list, phys_staff, m,
+                                staff_clefs_map.get(str(phys_staff), "treble")
+                            )
+                            geo_midi, geo_name = position_to_midi(int(pos), clef, fifths_val)
+                            t_midi = pn.get("pitch", 0)
+                            diff = abs(t_midi - geo_midi)
+                            if diff > 12:
+                                pn["pitch"] = geo_midi
+                                pn["pitch_name"] = geo_name
+                                correction_count += 1
+
+                parsed["metadata"]["pitch_corrections"] = correction_count
+                if correction_count > 0:
+                    print(f"[HOMR] Targeted pitch correction: {correction_count} notes overridden (diff>12)")
+            except Exception as e:
+                print(f"[HOMR] Targeted pitch correction failed: {e}")
+                import traceback; traceback.print_exc()
 
             # Post-process step 0: geometric clef detection + pitch recomputation
             # HOMR's transformer sometimes gets the clef wrong, which shifts all pitches.
