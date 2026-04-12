@@ -7,7 +7,7 @@ and note pixel positions from the segmentation pipeline.
 This code is licensed under AGPL-3.0 to comply with HOMR's license.
 """
 
-HANDLER_VERSION = "2.0-bug4-chords"
+HANDLER_VERSION = "3.0-geometric-pitch"
 
 import base64
 import io
@@ -414,10 +414,14 @@ def handler(event):
                     fifths=fifths,
                     staff_clefs_default=staff_clefs_default_int,
                 )
-                # Stats for logging
+                # Stats for logging AND response metadata
                 from collections import Counter
                 src_counts = Counter(n.get("pitch_source", "transformer") for n in parsed["notes"])
+                bucket_counts = {f"{s}_{m}": len(v) for (s, m), v in sorted(homr_buckets.items())}
+                parsed["metadata"]["pitch_resolution_sources"] = dict(src_counts)
+                parsed["metadata"]["homr_bucket_counts"] = bucket_counts
                 print(f"[HOMR] Geometric pitch resolution: {dict(src_counts)}")
+                print(f"[HOMR] HOMR buckets ({len(homr_buckets)}): {bucket_counts}")
             except Exception as e:
                 print(f"[HOMR] Geometric pitch resolution failed: {e}")
                 traceback.print_exc()
