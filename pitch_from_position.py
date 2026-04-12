@@ -271,22 +271,65 @@ def recompute_pitches_with_confidence(
                 note["pitch_source"] = "no_homr_data"
             continue
 
-        # Pair in order. Use the shorter of the two lists.
-        n = min(n_parsed, n_homr)
-        for i in range(n):
-            note = parsed_list[i]
-            homr = homr_list[i]
+        # Nearest-x-match: for each parsed note, find the closest HOMR
+        # note by x-coordinate that hasn't been claimed yet. This is
+        # robust against phantom detections (handwritten notes, bass clef
+        # dots misread as noteheads) — phantoms stay unclaimed and don't
+        # shift subsequent pairings.
+        #
+        # We need parsed notes' x-positions. They don't have pixel x,
+        # but they have start_time which is monotonically increasing
+        # and correlates to x. HOMR notes are sorted by x. So both
+        # sequences are in the same left-to-right order, and we can
+        # do a greedy forward-only match: for each parsed note, scan
+        # forward in the HOMR list from where we last matched, find
+        # the nearest x within a tolerance. Skip HOMR notes that are
+        # too far left (already passed).
+        #
+        # Since we don't have parsed x directly, use the HOMR ordering:
+        # walk both lists with a HOMR cursor. For each parsed note,
+        # advance the HOMR cursor to find the best match by allowing
+        # small skips (up to 3 HOMR notes ahead) to jump over phantoms.
+        homr_cursor = 0
+        matched = 0
+        for note in parsed_list:
             m = note.get("measure") or 1
             effective_clef = _effective_clef_at(
                 clef_changes, s, m,
                 default=staff_clefs_default.get(s, "treble"),
             )
-            _pair_and_score([note], [homr], effective_clef)
 
-        # Any unmatched parsed notes keep transformer pitch, lowered confidence
-        for i in range(n, n_parsed):
-            parsed_list[i]["pitch_confidence"] = 0.5
-            parsed_list[i]["pitch_source"] = "no_homr_match"
+            if homr_cursor >= n_homr:
+                note["pitch_confidence"] = 0.5
+                note["pitch_source"] = "no_homr_match"
+                continue
+
+            # Look ahead up to 3 positions to find the best HOMR match.
+            # "Best" = the one whose geometric pitch is closest to
+            # the transformer's pitch (since both should be reading
+            # the same note, small differences are normal).
+            best_idx = homr_cursor
+            best_diff = 999
+            lookahead = min(homr_cursor + 4, n_homr)
+            t_midi = int(note.get("pitch") or 0)
+            for j in range(homr_cursor, lookahead):
+                pos = homr_list[j].get("position")
+                if pos is None:
+                    continue
+                _, g = _diatonic_pitch(int(pos), effective_clef)
+                diff = abs(t_midi - g)
+                # Same pitch class (octave errors) treated as very close
+                if t_midi % 12 == g % 12:
+                    diff = min(diff, 1)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_idx = j
+
+            _pair_and_score([note], [homr_list[best_idx]], effective_clef)
+            homr_cursor = best_idx + 1
+            matched += 1
+
+        print(f"[pitch_from_position] staff {s}: matched {matched}/{n_parsed}")
 
     return notes
 
