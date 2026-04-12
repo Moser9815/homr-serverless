@@ -69,7 +69,7 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple:
         prepare_bar_line_image,
         parse_staffs,
     )
-    from homr.model import BarLine
+    from homr.model import BarLine, MultiStaff
     from homr.transformer.configs import Config as TransformerConfig
     from homr.simple_logging import eprint
     from homr.music_xml_generator import generate_xml, XmlGeneratorArguments
