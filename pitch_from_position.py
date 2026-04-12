@@ -304,29 +304,45 @@ def recompute_pitches_with_confidence(
                 note["pitch_source"] = "no_homr_match"
                 continue
 
-            # Look ahead up to 3 positions to find the best HOMR match.
-            # "Best" = the one whose geometric pitch is closest to
-            # the transformer's pitch (since both should be reading
-            # the same note, small differences are normal).
-            best_idx = homr_cursor
-            best_diff = 999
-            lookahead = min(homr_cursor + 4, n_homr)
             t_midi = int(note.get("pitch") or 0)
-            for j in range(homr_cursor, lookahead):
-                pos = homr_list[j].get("position")
-                if pos is None:
-                    continue
-                _, g = _diatonic_pitch(int(pos), effective_clef)
-                diff = abs(t_midi - g)
-                # Same pitch class (octave errors) treated as very close
-                if t_midi % 12 == g % 12:
-                    diff = min(diff, 1)
-                if diff < best_diff:
-                    best_diff = diff
-                    best_idx = j
 
-            _pair_and_score([note], [homr_list[best_idx]], effective_clef)
-            homr_cursor = best_idx + 1
+            # Check current HOMR note first.
+            cur_pos = homr_list[homr_cursor].get("position")
+            if cur_pos is not None:
+                _, g_cur = _diatonic_pitch(int(cur_pos), effective_clef)
+                diff_cur = abs(t_midi - g_cur)
+                if t_midi % 12 == g_cur % 12:
+                    diff_cur = min(diff_cur, 1)
+            else:
+                diff_cur = 999
+
+            if diff_cur <= 5:
+                # Current position is a reasonable match — take it.
+                _pair_and_score([note], [homr_list[homr_cursor]], effective_clef)
+                homr_cursor += 1
+            else:
+                # Current position looks like a phantom (diff > 5).
+                # Look ahead up to 3 to find the real note, skipping
+                # the phantom(s).
+                best_idx = homr_cursor
+                best_diff = diff_cur
+                lookahead = min(homr_cursor + 4, n_homr)
+                for j in range(homr_cursor + 1, lookahead):
+                    pos = homr_list[j].get("position")
+                    if pos is None:
+                        continue
+                    _, g = _diatonic_pitch(int(pos), effective_clef)
+                    diff = abs(t_midi - g)
+                    if t_midi % 12 == g % 12:
+                        diff = min(diff, 1)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_idx = j
+                _pair_and_score([note], [homr_list[best_idx]], effective_clef)
+                skipped = best_idx - homr_cursor
+                if skipped > 0:
+                    print(f"[pitch_from_position] staff {s}: skipped {skipped} phantom(s) at cursor {homr_cursor}")
+                homr_cursor = best_idx + 1
             matched += 1
 
         print(f"[pitch_from_position] staff {s}: matched {matched}/{n_parsed}")
