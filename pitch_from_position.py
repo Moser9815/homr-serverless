@@ -316,8 +316,12 @@ def recompute_pitches_with_confidence(
             else:
                 diff_cur = 999
 
-            if diff_cur <= 5:
+            if diff_cur <= 12:
                 # Current position is a reasonable match — take it.
+                # Threshold 12 = one octave. Real notes typically agree
+                # within an octave even when the transformer is wrong.
+                # Phantoms (handwriting/clef dots) map to unrelated
+                # positions → diff >> 12.
                 _pair_and_score([note], [homr_list[homr_cursor]], effective_clef)
                 homr_cursor += 1
             else:
