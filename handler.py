@@ -196,8 +196,12 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple:
         i = 0
         for ms in multi_staffs:
             if len(ms.staffs) == 1 and getattr(ms.staffs[0], 'is_grandstaff', False):
-                # This was a merged grand staff — use 2 individual staves
+                # This was a merged grand staff — use 2 individual staves.
+                # Mark both as is_grandstaff so parse_staff_tromr doesn't
+                # filter out "lower" position notes.
                 if i + 1 < len(staffs):
+                    staffs[i].is_grandstaff = True
+                    staffs[i + 1].is_grandstaff = True
                     unmerged_multi.append(MultiStaff([staffs[i], staffs[i + 1]], ms.connections))
                     i += 2
                 else:
