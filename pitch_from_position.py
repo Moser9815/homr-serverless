@@ -221,119 +221,72 @@ def recompute_pitches_with_confidence(
     if staff_clefs_default is None:
         staff_clefs_default = {}
 
-    # --- Step 1: sanity check measure alignment per staff ---
+    # --- Approach: global per-staff zip ---
+    # Measure-level bucketing via barline positions is unreliable (HOMR's
+    # barline detector counts system brackets, stems, etc. as barlines,
+    # inflating the measure count). Instead, we sort both sides per-staff
+    # by x (HOMR) / start_time (parsed) and pair them in order.
+    #
+    # This works because:
+    # - HOMR's segmentation and the transformer see the SAME notes in the
+    #   same left-to-right order.
+    # - Per-staff global counts match closely (Drift Away: 133=133 for
+    #   staff 1; 79 vs 75 for staff 2).
+    # - When counts differ slightly (e.g. HOMR detects 4 extra noteheads),
+    #   we truncate to the shorter list — a few unmatched notes at the end
+    #   keep transformer pitch with lowered confidence.
     from collections import defaultdict
-    parsed_count: dict = defaultdict(lambda: defaultdict(int))  # [staff][measure] -> count
-    for n in notes:
-        s = n.get("staff") or 1
-        m = n.get("measure") or 1
-        parsed_count[s][m] += 1
 
-    homr_count: dict = defaultdict(lambda: defaultdict(int))
-    for (s, m), bucket in homr_staff_buckets.items():
-        homr_count[s][m] = len(bucket)
+    # Flatten homr_buckets into per-staff sorted lists
+    homr_by_staff: dict[int, list] = defaultdict(list)
+    for (s, _m), bucket in homr_staff_buckets.items():
+        homr_by_staff[s].extend(bucket)
+    for s in homr_by_staff:
+        homr_by_staff[s].sort(key=lambda h: (h["x"], h["y"]))
 
-    # A staff is trustworthy if every measure matches on count.
-    staff_trusted: dict[int, bool] = {}
-    mismatches_per_staff: dict[int, list] = defaultdict(list)
-    for s in set(list(parsed_count.keys()) + list(homr_count.keys())):
-        trusted = True
-        all_measures = set(parsed_count[s].keys()) | set(homr_count[s].keys())
-        for m in sorted(all_measures):
-            if parsed_count[s][m] != homr_count[s][m]:
-                trusted = False
-                mismatches_per_staff[s].append(
-                    f"m{m}: parsed={parsed_count[s][m]} homr={homr_count[s][m]}"
-                )
-        staff_trusted[s] = trusted
-        if not trusted:
-            print(f"[pitch_from_position] staff {s} measure alignment mismatch, "
-                  f"degrading confidence: {mismatches_per_staff[s][:5]}")
-
-    # --- Step 2: group parsed notes by (staff, measure) for chord-aware pairing ---
-    # Within each group, we'll walk them in sub-groups keyed by `beat` to
-    # identify chords. For each chord, pair parsed notes (sorted by MIDI
-    # descending — highest pitch first) against the same number of HOMR
-    # notes from the bucket (sorted by y ascending — lowest y first =
-    # highest pitch on the staff).
-    from collections import defaultdict
-    parsed_groups: dict = defaultdict(list)  # {(s, m): [note_dict, ...]}
+    # Group parsed notes by staff, preserving document order (which is
+    # time-order within each staff for well-formed MusicXML).
+    parsed_by_staff: dict[int, list] = defaultdict(list)
     for note in notes:
         s = note.get("staff") or 1
-        m = note.get("measure") or 1
-        parsed_groups[(s, m)].append(note)
+        parsed_by_staff[s].append(note)
 
-    # Pre-init the diagnostic fields on every note so callers can rely on them
+    # Pre-init diagnostic fields
     for note in notes:
         note["pitch_transformer"] = int(note.get("pitch") or 0)
         note["pitch_geometric"] = None
         note["pitch_confidence"] = 1.0
         note["pitch_source"] = "transformer"
 
-    for (s, m), group in parsed_groups.items():
-        if not staff_trusted.get(s, False):
-            for note in group:
+    for s in parsed_by_staff:
+        parsed_list = parsed_by_staff[s]
+        homr_list = homr_by_staff.get(s, [])
+        n_parsed = len(parsed_list)
+        n_homr = len(homr_list)
+        print(f"[pitch_from_position] staff {s}: parsed={n_parsed} homr={n_homr}")
+
+        if n_homr == 0:
+            for note in parsed_list:
                 note["pitch_confidence"] = 0.5
-                note["pitch_source"] = "untrusted_staff"
+                note["pitch_source"] = "no_homr_data"
             continue
 
-        bucket = homr_staff_buckets.get((s, m)) or []
-        if not bucket:
-            for note in group:
-                note["pitch_confidence"] = 0.5
-                note["pitch_source"] = "no_homr_match"
-            continue
+        # Pair in order. Use the shorter of the two lists.
+        n = min(n_parsed, n_homr)
+        for i in range(n):
+            note = parsed_list[i]
+            homr = homr_list[i]
+            m = note.get("measure") or 1
+            effective_clef = _effective_clef_at(
+                clef_changes, s, m,
+                default=staff_clefs_default.get(s, "treble"),
+            )
+            _pair_and_score([note], [homr], effective_clef)
 
-        effective_clef = _effective_clef_at(
-            clef_changes, s, m,
-            default=staff_clefs_default.get(s, "treble"),
-        )
-
-        # Split into beat-based chord sub-groups, preserving document order.
-        chord_subs: list = []
-        current_beat = None
-        for note in group:
-            beat = note.get("beat", 0)
-            if current_beat is None or beat != current_beat:
-                chord_subs.append([note])
-                current_beat = beat
-            else:
-                chord_subs[-1].append(note)
-
-        # HOMR bucket entries: sort by x first, then group consecutive same-x
-        # entries as chord clusters (HOMR puts chord notes at identical x).
-        homr_sorted = sorted(bucket, key=lambda h: (h["x"], h["y"]))
-        homr_chords: list = []
-        if homr_sorted:
-            current_cluster = [homr_sorted[0]]
-            for h in homr_sorted[1:]:
-                if abs(h["x"] - current_cluster[-1]["x"]) <= 3:  # px tolerance
-                    current_cluster.append(h)
-                else:
-                    homr_chords.append(current_cluster)
-                    current_cluster = [h]
-            homr_chords.append(current_cluster)
-
-        # Pair parsed chord sub-groups with HOMR chord clusters by position.
-        # If counts mismatch, fall back to note-by-note ordinal pairing for
-        # the remainder of the group.
-        chord_pairs_ok = len(chord_subs) == len(homr_chords)
-
-        if chord_pairs_ok:
-            for parsed_chord, homr_cluster in zip(chord_subs, homr_chords):
-                # Sort parsed notes by MIDI descending (highest pitch first)
-                # and HOMR by y ascending (highest pitch first on the staff)
-                parsed_sorted = sorted(parsed_chord, key=lambda n: -int(n.get("pitch") or 0))
-                homr_cluster_sorted = sorted(homr_cluster, key=lambda h: h["y"])
-                _pair_and_score(parsed_sorted, homr_cluster_sorted, effective_clef)
-        else:
-            # Fallback: ordinal pairing across the whole (s, m) bucket.
-            for i, note in enumerate(group):
-                if i >= len(bucket):
-                    note["pitch_confidence"] = 0.5
-                    note["pitch_source"] = "no_homr_match"
-                    continue
-                _pair_and_score([note], [bucket[i]], effective_clef)
+        # Any unmatched parsed notes keep transformer pitch, lowered confidence
+        for i in range(n, n_parsed):
+            parsed_list[i]["pitch_confidence"] = 0.5
+            parsed_list[i]["pitch_source"] = "no_homr_match"
 
     return notes
 
