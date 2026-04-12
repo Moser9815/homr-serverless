@@ -308,6 +308,10 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple:
 
         # Advance global measure counter by the number of measures in this
         # system so the next system's buckets land on the right global #.
+        # NOTE: this trusts HOMR's barline count. If HOMR drops a final
+        # double-barline, the next system drifts. The downstream sanity
+        # check in recompute_pitches_with_confidence will catch count
+        # mismatches per staff and fall back to transformer pitch.
         running_measure += num_measures_in_system
 
     # Clef/key symbol bounding boxes (for clef classification)

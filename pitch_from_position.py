@@ -250,47 +250,38 @@ def recompute_pitches_with_confidence(
             print(f"[pitch_from_position] staff {s} measure alignment mismatch, "
                   f"degrading confidence: {mismatches_per_staff[s][:5]}")
 
-    # --- Step 2: walk notes, override pitch where safe ---
-    # Track idx_in_measure per (staff, measure) as we iterate.
-    idx_counter: dict = defaultdict(int)
-    # Per (staff, measure) chord grouping: build in-place mapping of
-    # HOMR bucket sort-keys vs parsed note sort-keys for same-beat groups.
-    # Simple approach first: iterate linearly, matching by ordinal position
-    # within the bucket. Chord handling is a follow-up.
-
+    # --- Step 2: group parsed notes by (staff, measure) for chord-aware pairing ---
+    # Within each group, we'll walk them in sub-groups keyed by `beat` to
+    # identify chords. For each chord, pair parsed notes (sorted by MIDI
+    # descending — highest pitch first) against the same number of HOMR
+    # notes from the bucket (sorted by y ascending — lowest y first =
+    # highest pitch on the staff).
+    from collections import defaultdict
+    parsed_groups: dict = defaultdict(list)  # {(s, m): [note_dict, ...]}
     for note in notes:
         s = note.get("staff") or 1
         m = note.get("measure") or 1
-        t_midi = int(note.get("pitch") or 0)
-        alter = 0  # transformer's alter is already baked into pitch; diff
-                   # comparison below is MIDI-to-MIDI so accidentals survive.
+        parsed_groups[(s, m)].append(note)
 
-        note["pitch_transformer"] = t_midi
+    # Pre-init the diagnostic fields on every note so callers can rely on them
+    for note in notes:
+        note["pitch_transformer"] = int(note.get("pitch") or 0)
         note["pitch_geometric"] = None
         note["pitch_confidence"] = 1.0
         note["pitch_source"] = "transformer"
 
+    for (s, m), group in parsed_groups.items():
         if not staff_trusted.get(s, False):
-            # Untrusted staff — keep transformer pitch, confidence 0.5
-            note["pitch_confidence"] = 0.5
-            note["pitch_source"] = "untrusted_staff"
+            for note in group:
+                note["pitch_confidence"] = 0.5
+                note["pitch_source"] = "untrusted_staff"
             continue
 
         bucket = homr_staff_buckets.get((s, m)) or []
-        idx = idx_counter[(s, m)]
-        idx_counter[(s, m)] += 1
-
-        if idx >= len(bucket):
-            # Ran out of HOMR notes for this measure — no geometric pitch
-            note["pitch_confidence"] = 0.5
-            note["pitch_source"] = "no_homr_match"
-            continue
-
-        homr_note = bucket[idx]
-        position = homr_note.get("position") if isinstance(homr_note, dict) else getattr(homr_note, "position", None)
-        if position is None:
-            note["pitch_confidence"] = 0.5
-            note["pitch_source"] = "no_position"
+        if not bucket:
+            for note in group:
+                note["pitch_confidence"] = 0.5
+                note["pitch_source"] = "no_homr_match"
             continue
 
         effective_clef = _effective_clef_at(
@@ -298,33 +289,99 @@ def recompute_pitches_with_confidence(
             default=staff_clefs_default.get(s, "treble"),
         )
 
-        # Compute geometric MIDI, preserving transformer's accidental if any.
-        _, geo_midi = _diatonic_pitch(int(position), effective_clef)
-        # Preserve accidentals: if the transformer's pitch differs from the
-        # geometric diatonic pitch by ±1 semitone AND they agree on octave,
-        # the transformer likely has an accidental we should keep.
-        # Otherwise use the raw geometric pitch.
-        diatonic_diff = t_midi - geo_midi
-        if diatonic_diff in (-1, 1) and abs(t_midi - geo_midi) <= 1:
-            # Preserve transformer's accidental by adding it onto geometric
-            geo_midi_with_accidental = t_midi
+        # Split into beat-based chord sub-groups, preserving document order.
+        chord_subs: list = []
+        current_beat = None
+        for note in group:
+            beat = note.get("beat", 0)
+            if current_beat is None or beat != current_beat:
+                chord_subs.append([note])
+                current_beat = beat
+            else:
+                chord_subs[-1].append(note)
+
+        # HOMR bucket entries: sort by x first, then group consecutive same-x
+        # entries as chord clusters (HOMR puts chord notes at identical x).
+        homr_sorted = sorted(bucket, key=lambda h: (h["x"], h["y"]))
+        homr_chords: list = []
+        if homr_sorted:
+            current_cluster = [homr_sorted[0]]
+            for h in homr_sorted[1:]:
+                if abs(h["x"] - current_cluster[-1]["x"]) <= 3:  # px tolerance
+                    current_cluster.append(h)
+                else:
+                    homr_chords.append(current_cluster)
+                    current_cluster = [h]
+            homr_chords.append(current_cluster)
+
+        # Pair parsed chord sub-groups with HOMR chord clusters by position.
+        # If counts mismatch, fall back to note-by-note ordinal pairing for
+        # the remainder of the group.
+        chord_pairs_ok = len(chord_subs) == len(homr_chords)
+
+        if chord_pairs_ok:
+            for parsed_chord, homr_cluster in zip(chord_subs, homr_chords):
+                # Sort parsed notes by MIDI descending (highest pitch first)
+                # and HOMR by y ascending (highest pitch first on the staff)
+                parsed_sorted = sorted(parsed_chord, key=lambda n: -int(n.get("pitch") or 0))
+                homr_cluster_sorted = sorted(homr_cluster, key=lambda h: h["y"])
+                _pair_and_score(parsed_sorted, homr_cluster_sorted, effective_clef)
         else:
-            geo_midi_with_accidental = geo_midi
-
-        confidence, chosen, reason = _score_confidence(t_midi, geo_midi_with_accidental)
-
-        note["pitch_geometric"] = geo_midi
-        note["pitch_confidence"] = confidence
-        if confidence < 1.0:
-            note["pitch"] = chosen
-            note["pitch_source"] = f"geometric:{reason}"
-            # Recompute pitch_name from new MIDI
-            octave_new = (chosen // 12) - 1
-            semitone = chosen % 12
-            sharps = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-            note["pitch_name"] = f"{sharps[semitone]}{octave_new}"
+            # Fallback: ordinal pairing across the whole (s, m) bucket.
+            for i, note in enumerate(group):
+                if i >= len(bucket):
+                    note["pitch_confidence"] = 0.5
+                    note["pitch_source"] = "no_homr_match"
+                    continue
+                _pair_and_score([note], [bucket[i]], effective_clef)
 
     return notes
+
+
+def _pair_and_score(parsed_notes: list, homr_notes: list, effective_clef: str) -> None:
+    """Pair parsed notes with HOMR position entries (same length) and
+    populate pitch_geometric / pitch_confidence / pitch fields. Preserves
+    transformer accidentals when disagreement is exactly 1 semitone."""
+    n = min(len(parsed_notes), len(homr_notes))
+    for i in range(n):
+        note = parsed_notes[i]
+        homr = homr_notes[i]
+        position = homr.get("position") if isinstance(homr, dict) else getattr(homr, "position", None)
+        if position is None:
+            note["pitch_confidence"] = 0.5
+            note["pitch_source"] = "no_position"
+            continue
+
+        t_midi = int(note.get("pitch") or 0)
+        _, geo_midi = _diatonic_pitch(int(position), effective_clef)
+        note["pitch_geometric"] = geo_midi
+
+        # Score confidence on RAW values (don't let accidental preservation
+        # inflate the confidence to 1.0 — the reviewer caught this).
+        confidence, _, reason = _score_confidence(t_midi, geo_midi)
+        note["pitch_confidence"] = confidence
+
+        if confidence == 1.0:
+            # Agreement — keep transformer pitch unchanged.
+            note["pitch_source"] = "agreement"
+            continue
+
+        # 1-semitone disagreement almost always means transformer has an
+        # accidental that geometric (diatonic-only) lacks. Trust transformer
+        # for pitch but keep the confidence score low so the uncertainty is
+        # visible downstream.
+        if abs(t_midi - geo_midi) == 1:
+            note["pitch_source"] = f"transformer_accidental:{reason}"
+            # pitch already == t_midi, no change
+            continue
+
+        # Larger disagreement: use geometric pitch.
+        note["pitch"] = geo_midi
+        note["pitch_source"] = f"geometric:{reason}"
+        octave_new = (geo_midi // 12) - 1
+        semitone = geo_midi % 12
+        sharps = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        note["pitch_name"] = f"{sharps[semitone]}{octave_new}"
 
 
 def determine_clef_from_positions(
