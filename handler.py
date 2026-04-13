@@ -7,7 +7,7 @@ and note pixel positions from the segmentation pipeline.
 This code is licensed under AGPL-3.0 to comply with HOMR's license.
 """
 
-HANDLER_VERSION = "4.0-confidence-pitch"
+HANDLER_VERSION = "4.1-geometric-pitch-fix"
 
 import base64
 import io
@@ -576,22 +576,23 @@ def handler(event):
                 else:
                     geometric_clef_status = f"no_visual,keeping:{transformer_clef}"
 
-                # If overriding, recompute pitches using the unified cursor-matching
-                # algorithm (not the old naive global-zip recompute_pitches).
+                # If overriding, inject the clef override into metadata so
+                # Step 1's pitch recomputation uses the corrected clef.
+                # Do NOT recompute pitches here — single pass in Step 1
+                # avoids the double-pass overwrite bug (expert review #14).
                 if determined_clef != transformer_clef:
                     print(f"[HOMR] Clef override: {transformer_clef} → {determined_clef}")
-                    fifths_str = parsed.get("metadata", {}).get("fifths", 0)
-                    fifths = int(fifths_str) if fifths_str else 0
-                    # Build a clef_changes list with only the overridden clef
-                    override_clef_changes = [{"staff": 1, "measure": 1, "clef": determined_clef}]
-                    override_staff_clefs = {1: determined_clef}
-                    parsed["notes"] = recompute_pitches_with_confidence(
-                        parsed["notes"], homr_buckets, override_clef_changes,
-                        fifths=fifths, staff_clefs_default=override_staff_clefs,
-                    )
                     parsed["metadata"]["clef"] = determined_clef
                     parsed["metadata"]["clef_override"] = True
-                    geometric_clef_status += f",recomputed"
+                    # Inject override into clef_changes so Step 1 picks it up
+                    existing_changes = parsed.get("metadata", {}).get("clef_changes") or []
+                    existing_changes.insert(0, {"staff": 1, "measure": 1, "clef": determined_clef})
+                    parsed["metadata"]["clef_changes"] = existing_changes
+                    # Also update staff_clefs default
+                    staff_clefs = parsed.get("metadata", {}).get("staff_clefs") or {}
+                    staff_clefs["1"] = determined_clef
+                    parsed["metadata"]["staff_clefs"] = staff_clefs
+                    geometric_clef_status += f",injected_for_step1"
                 else:
                     print(f"[HOMR] Clef confirmed: {determined_clef}")
 
@@ -605,7 +606,7 @@ def handler(event):
             # or when disagreement < 7 AND pitch_confidence < 0.5.
             # Feature-flagged for safe rollout. Runs AFTER clef override
             # so it benefits from corrected clef when applicable.
-            geometric_pitch_enabled = os.environ.get("GEOMETRIC_PITCH_ENABLED", "false").lower() == "true"
+            geometric_pitch_enabled = os.environ.get("GEOMETRIC_PITCH_ENABLED", "true").lower() == "true"
             pitch_correction_status = "disabled"
             if geometric_pitch_enabled and homr_buckets:
                 try:
