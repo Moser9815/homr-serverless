@@ -103,47 +103,15 @@ def position_to_midi(position: int, clef: str, fifths: int = 0) -> tuple[int, st
     return base_midi, pitch_name
 
 
-def recompute_pitches(
-    notes: list[dict],
-    note_positions: list[dict],
-    clef: str,
-    fifths: int = 0,
-) -> list[dict]:
-    """
-    Recompute note pitches from geometric positions.
-
-    Matches notes to note_positions by order within each staff,
-    then computes pitch from position + clef.
-
-    Args:
-        notes: Parsed notes from MusicXML (with transformer pitches)
-        note_positions: Pixel positions with staff_idx from segmentation
-        clef: Determined clef ("treble", "bass", "alto")
-        fifths: Key signature
-
-    Returns:
-        Updated notes list with corrected pitches
-    """
-    if not note_positions:
-        return notes
-
-    # note_positions have "position" field (staff line/space index)
-    # Match by index order (both are ordered by staff, then left-to-right)
-    for i, note in enumerate(notes):
-        if i < len(note_positions) and "position" in note_positions[i]:
-            pos = note_positions[i]["position"]
-            midi, name = position_to_midi(pos, clef, fifths)
-            note["pitch"] = midi
-            note["pitch_name"] = name
-            note["pitch_source"] = "geometric"
-
-    return notes
+# recompute_pitches() DELETED — was a naive global-zip approach that broke
+# on phantom noteheads. Use recompute_pitches_with_confidence() instead.
+# (Deleted in Phase 1, Step 1.2 of the OMR Accuracy Improvements plan.)
 
 
 def _effective_clef_at(clef_changes: list[dict], staff: int, measure: int, default: str) -> str:
-    """Walk clef_changes and return the most recent clef <= (staff, measure)."""
+    """Return the most recent clef at or before (staff, measure)."""
     current = default
-    for change in clef_changes:
+    for change in sorted(clef_changes, key=lambda c: c["measure"]):
         if change["staff"] == staff and change["measure"] <= measure:
             current = change["clef"]
     return current
@@ -167,20 +135,44 @@ def _diatonic_pitch(position: int, clef: str) -> tuple[int, int]:
     return note_within, midi
 
 
-def _score_confidence(t_midi: int, g_midi: int) -> tuple[float, int, str]:
-    """Compare transformer and geometric MIDI values. Return (confidence,
-    chosen_midi, reason). Lower confidence → geometric wins."""
-    if t_midi == g_midi:
-        return (1.0, t_midi, "exact")
-    # Same pitch class (octave error)
-    if t_midi % 12 == g_midi % 12:
-        return (0.8, g_midi, "octave_off")
-    diff = abs(t_midi - g_midi)
-    if diff <= 2:
-        return (0.5, g_midi, "step_error")
-    if diff <= 5:
-        return (0.3, g_midi, "medium_error")
-    return (0.2, g_midi, "hallucination")
+def remap_grand_staff_position(position: int, staff_number: int) -> tuple[int, str]:
+    """Remap a merged grand-staff position to a per-physical-staff position.
+
+    HOMR's 10-line merged grid assigns:
+      positions 1-9  → bottom physical staff (staff_number 2 = bass)
+      positions 11-19 → top physical staff (staff_number 1 = treble)
+      position 10 → gap between staves
+      positions < 1 or > 19 → ledger lines (pass through)
+
+    Args:
+        position: Raw position from HOMR segmentation (merged grid)
+        staff_number: 1 = top staff, 2 = bottom staff
+
+    Returns:
+        (remapped_position, clef_hint) where remapped_position is
+        relative to a single 5-line staff (1-9), and clef_hint is
+        the expected clef for that physical staff.
+    """
+    if staff_number == 2:
+        # Bottom staff — positions 1-9 are already relative to the
+        # bottom physical staff. No remapping needed.
+        return (position, "bass")
+    elif staff_number == 1:
+        # Top staff — positions 11-19 on the merged grid correspond
+        # to positions 1-9 on the top physical staff.
+        if position >= 11:
+            return (position - 10, "treble")
+        elif position == 10:
+            # Gap — ledger line above bottom staff / below top staff
+            return (0, "treble")
+        else:
+            # Note is in the bottom half of the grid but assigned to
+            # the top staff by y-coordinate. The physical position is
+            # in bass territory — use bass clef for pitch computation
+            # regardless of the y-coordinate classifier's opinion.
+            return (position, "bass")
+    else:
+        return (position, "treble")
 
 
 def recompute_pitches_with_confidence(
@@ -190,57 +182,56 @@ def recompute_pitches_with_confidence(
     fifths: int = 0,
     staff_clefs_default: dict | None = None,
 ) -> list[dict]:
-    """Second-pass pitch resolution.
+    """Second-pass pitch resolution with confidence-weighted selective override.
 
     For each parsed note, compute a geometric pitch from HOMR's
     per-note `position` + the effective clef for its (staff, measure).
-    Compare against the transformer's pitch. Choose the final pitch
-    based on a confidence score. Emit the confidence + both candidates
-    alongside the chosen pitch.
+    Compare against the transformer's pitch. Override ONLY when:
+      - Disagreement >= 7 semitones (obvious hallucination), OR
+      - Disagreement < 7 AND pitch_confidence < 0.5 (transformer uncertain)
+    Otherwise, keep transformer pitch and flag the disagreement.
+
+    Includes grand staff position remapping for merged 10-line staves.
 
     Args:
         notes: parsed notes (mutated in place; also returned)
         homr_staff_buckets: dict keyed (staff_number, measure_number)
-            → list of HomrNote objects in x-order. The HomrNote objects
-            must expose `.position` (int) and, optionally, `.center[1]`
-            (y pixel) for chord sorting.
+            -> list of dicts with "position", "x", "y" in x-order.
         clef_changes: ordered list of {staff, measure, clef} entries
             (from parse_musicxml metadata.clef_changes).
-        fifths: key signature (ignored for now — we use per-note `alter`
-            from transformer to preserve accidentals).
+        fifths: key signature (used for diatonic pitch computation).
         staff_clefs_default: {staff: clef_name} initial clef fallback.
 
     Returns:
-        The same notes list with these fields added per note:
-            pitch_transformer (int) — original
-            pitch_geometric (int | None) — may be None if no match
-            pitch_confidence (float 0-1)
-            pitch_source ("transformer" | "geometric" | "fallback")
-            pitch (int) — final chosen value
+        The same notes list with these fields added/updated per note:
+            pitch_transformer (int) -- original
+            pitch_geometric (int | None) -- may be None if no match
+            pitch_confidence (float 0-1) -- overall confidence
+            pitch_source ("transformer" | "geometric" | ...)
+            pitch (int) -- final chosen value
     """
     if staff_clefs_default is None:
         staff_clefs_default = {}
 
-    # --- Approach: global per-staff zip ---
-    # Measure-level bucketing via barline positions is unreliable (HOMR's
-    # barline detector counts system brackets, stems, etc. as barlines,
-    # inflating the measure count). Instead, we sort both sides per-staff
-    # by x (HOMR) / start_time (parsed) and pair them in order.
-    #
-    # This works because:
-    # - HOMR's segmentation and the transformer see the SAME notes in the
-    #   same left-to-right order.
-    # - Per-staff global counts match closely (Drift Away: 133=133 for
-    #   staff 1; 79 vs 75 for staff 2).
-    # - When counts differ slightly (e.g. HOMR detects 4 extra noteheads),
-    #   we truncate to the shorter list — a few unmatched notes at the end
-    #   keep transformer pitch with lowered confidence.
     from collections import defaultdict
 
-    # Flatten homr_buckets into per-staff sorted lists
+    # Detect grand staff: if any bucket key has staff_number 2, it's grand staff
+    has_grand_staff = any(s == 2 for (s, _) in homr_staff_buckets.keys())
+
+    # Flatten homr_buckets into per-staff sorted lists, applying
+    # grand staff position remapping if needed.
     homr_by_staff: dict[int, list] = defaultdict(list)
     for (s, _m), bucket in homr_staff_buckets.items():
-        homr_by_staff[s].extend(bucket)
+        for h in bucket:
+            entry = dict(h)  # shallow copy
+            if has_grand_staff and "position" in entry:
+                remapped_pos, clef_hint = remap_grand_staff_position(
+                    int(entry["position"]), s
+                )
+                entry["position_original"] = entry["position"]
+                entry["position"] = remapped_pos
+                entry["clef_hint"] = clef_hint
+            homr_by_staff[s].append(entry)
     for s in homr_by_staff:
         homr_by_staff[s].sort(key=lambda h: (h["x"], h["y"]))
 
@@ -251,11 +242,13 @@ def recompute_pitches_with_confidence(
         s = note.get("staff") or 1
         parsed_by_staff[s].append(note)
 
-    # Pre-init diagnostic fields
+    # Pre-init diagnostic fields (preserve any pitch_confidence already
+    # set by the confidence monkey-patch)
     for note in notes:
         note["pitch_transformer"] = int(note.get("pitch") or 0)
         note["pitch_geometric"] = None
-        note["pitch_confidence"] = 1.0
+        if "pitch_confidence" not in note:
+            note["pitch_confidence"] = 1.0
         note["pitch_source"] = "transformer"
 
     for s in parsed_by_staff:
@@ -267,40 +260,33 @@ def recompute_pitches_with_confidence(
 
         if n_homr == 0:
             for note in parsed_list:
-                note["pitch_confidence"] = 0.5
                 note["pitch_source"] = "no_homr_data"
             continue
 
-        # Nearest-x-match: for each parsed note, find the closest HOMR
-        # note by x-coordinate that hasn't been claimed yet. This is
-        # robust against phantom detections (handwritten notes, bass clef
-        # dots misread as noteheads) — phantoms stay unclaimed and don't
-        # shift subsequent pairings.
-        #
-        # We need parsed notes' x-positions. They don't have pixel x,
-        # but they have start_time which is monotonically increasing
-        # and correlates to x. HOMR notes are sorted by x. So both
-        # sequences are in the same left-to-right order, and we can
-        # do a greedy forward-only match: for each parsed note, scan
-        # forward in the HOMR list from where we last matched, find
-        # the nearest x within a tolerance. Skip HOMR notes that are
-        # too far left (already passed).
-        #
-        # Since we don't have parsed x directly, use the HOMR ordering:
-        # walk both lists with a HOMR cursor. For each parsed note,
-        # advance the HOMR cursor to find the best match by allowing
-        # small skips (up to 3 HOMR notes ahead) to jump over phantoms.
+        # Greedy cursor-matching: walk both lists in x-order.
+        # For each parsed note, advance the HOMR cursor allowing small
+        # skips (up to 3) to jump over phantom noteheads.
         homr_cursor = 0
         matched = 0
+        overridden = 0
+        flagged = 0
         for note in parsed_list:
             m = note.get("measure") or 1
-            effective_clef = _effective_clef_at(
-                clef_changes, s, m,
-                default=staff_clefs_default.get(s, "treble"),
-            )
+
+            # For grand staff, use the clef hint from remapping if available
+            if has_grand_staff and homr_cursor < n_homr:
+                effective_clef = homr_list[homr_cursor].get(
+                    "clef_hint",
+                    _effective_clef_at(clef_changes, s, m,
+                                       default=staff_clefs_default.get(s, "treble")),
+                )
+            else:
+                effective_clef = _effective_clef_at(
+                    clef_changes, s, m,
+                    default=staff_clefs_default.get(s, "treble"),
+                )
 
             if homr_cursor >= n_homr:
-                note["pitch_confidence"] = 0.5
                 note["pitch_source"] = "no_homr_match"
                 continue
 
@@ -318,16 +304,11 @@ def recompute_pitches_with_confidence(
 
             if diff_cur <= 12:
                 # Current position is a reasonable match — take it.
-                # Threshold 12 = one octave. Real notes typically agree
-                # within an octave even when the transformer is wrong.
-                # Phantoms (handwriting/clef dots) map to unrelated
-                # positions → diff >> 12.
-                _pair_and_score([note], [homr_list[homr_cursor]], effective_clef)
+                _apply_selective_override(note, homr_list[homr_cursor], effective_clef)
                 homr_cursor += 1
             else:
-                # Current position looks like a phantom (diff > 5).
-                # Look ahead up to 3 to find the real note, skipping
-                # the phantom(s).
+                # Current position looks like a phantom. Look ahead up
+                # to 3 to find the real note, skipping phantom(s).
                 best_idx = homr_cursor
                 best_diff = diff_cur
                 lookahead = min(homr_cursor + 4, n_homr)
@@ -335,69 +316,99 @@ def recompute_pitches_with_confidence(
                     pos = homr_list[j].get("position")
                     if pos is None:
                         continue
-                    _, g = _diatonic_pitch(int(pos), effective_clef)
+                    eff_clef_j = homr_list[j].get("clef_hint", effective_clef)
+                    _, g = _diatonic_pitch(int(pos), eff_clef_j)
                     diff = abs(t_midi - g)
                     if t_midi % 12 == g % 12:
                         diff = min(diff, 1)
                     if diff < best_diff:
                         best_diff = diff
                         best_idx = j
-                _pair_and_score([note], [homr_list[best_idx]], effective_clef)
+                _apply_selective_override(note, homr_list[best_idx],
+                                          homr_list[best_idx].get("clef_hint", effective_clef))
                 skipped = best_idx - homr_cursor
                 if skipped > 0:
                     print(f"[pitch_from_position] staff {s}: skipped {skipped} phantom(s) at cursor {homr_cursor}")
                 homr_cursor = best_idx + 1
             matched += 1
 
-        print(f"[pitch_from_position] staff {s}: matched {matched}/{n_parsed}")
+            # Count outcomes
+            src = note.get("pitch_source", "")
+            if "geometric" in src:
+                overridden += 1
+            elif "flagged" in src:
+                flagged += 1
+
+        print(f"[pitch_from_position] staff {s}: matched {matched}/{n_parsed}, "
+              f"overridden={overridden}, flagged={flagged}")
 
     return notes
 
 
-def _pair_and_score(parsed_notes: list, homr_notes: list, effective_clef: str) -> None:
-    """Pair parsed notes with HOMR position entries (same length) and
-    populate pitch_geometric / pitch_confidence / pitch fields. Preserves
-    transformer accidentals when disagreement is exactly 1 semitone."""
-    n = min(len(parsed_notes), len(homr_notes))
-    for i in range(n):
-        note = parsed_notes[i]
-        homr = homr_notes[i]
-        position = homr.get("position") if isinstance(homr, dict) else getattr(homr, "position", None)
-        if position is None:
-            note["pitch_confidence"] = 0.5
-            note["pitch_source"] = "no_position"
-            continue
+def _apply_selective_override(note: dict, homr_entry: dict, effective_clef: str) -> None:
+    """Apply confidence-weighted selective pitch override for a single note.
 
-        t_midi = int(note.get("pitch") or 0)
-        _, geo_midi = _diatonic_pitch(int(position), effective_clef)
-        note["pitch_geometric"] = geo_midi
+    Override rules (from the plan):
+      - Exact agreement (diff == 0): keep transformer, confidence = 1.0
+      - 1-semitone diff: keep transformer (likely accidental)
+      - Disagree >= 7 semitones: OVERRIDE with geometric
+      - Disagree < 7 AND pitch_confidence < 0.5: OVERRIDE with geometric
+      - Disagree < 7 AND pitch_confidence >= 0.5: FLAG but don't override
+      - Preserve transformer's accidental knowledge (geometric is diatonic only)
+    """
+    position = homr_entry.get("position")
+    if position is None:
+        note["pitch_source"] = "no_position"
+        return
 
-        # Score confidence on RAW values (don't let accidental preservation
-        # inflate the confidence to 1.0 — the reviewer caught this).
-        confidence, _, reason = _score_confidence(t_midi, geo_midi)
-        note["pitch_confidence"] = confidence
+    t_midi = int(note.get("pitch") or 0)
+    _, geo_midi = _diatonic_pitch(int(position), effective_clef)
+    note["pitch_geometric"] = geo_midi
 
-        if confidence == 1.0:
-            # Agreement — keep transformer pitch unchanged.
-            note["pitch_source"] = "agreement"
-            continue
+    diff = abs(t_midi - geo_midi)
 
-        # 1-semitone disagreement almost always means transformer has an
-        # accidental that geometric (diatonic-only) lacks. Trust transformer
-        # for pitch but keep the confidence score low so the uncertainty is
-        # visible downstream.
-        if abs(t_midi - geo_midi) == 1:
-            note["pitch_source"] = f"transformer_accidental:{reason}"
-            # pitch already == t_midi, no change
-            continue
+    if diff == 0:
+        # Exact agreement — no change needed
+        note["pitch_source"] = "agreement"
+        return
 
-        # Larger disagreement: use geometric pitch.
-        note["pitch"] = geo_midi
-        note["pitch_source"] = f"geometric:{reason}"
-        octave_new = (geo_midi // 12) - 1
-        semitone = geo_midi % 12
-        sharps = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-        note["pitch_name"] = f"{sharps[semitone]}{octave_new}"
+    if diff == 1:
+        # 1-semitone disagreement: transformer likely has an accidental
+        # that geometric (diatonic-only) can't see. Trust transformer.
+        note["pitch_source"] = "transformer_accidental"
+        return
+
+    # Get the decoder's pitch confidence (set by monkey-patch)
+    # If not set (legacy data), default to 0.9 (trust transformer)
+    decoder_confidence = note.get("pitch_confidence", 0.9)
+
+    if diff >= 7:
+        # Large disagreement (>= perfect fifth): override with geometric.
+        # This catches Bug #20 territory (sub-octave hallucinations).
+        _override_pitch(note, geo_midi, f"geometric:hallucination(diff={diff})")
+    elif decoder_confidence < 0.5:
+        # Moderate disagreement + low decoder confidence: override.
+        _override_pitch(note, geo_midi,
+                        f"geometric:low_conf(diff={diff},conf={decoder_confidence:.2f})")
+    else:
+        # Moderate disagreement + confident decoder: flag but don't override.
+        # The decoder is reasonably sure, and the disagreement isn't extreme.
+        note["pitch_source"] = f"flagged:disagree(diff={diff},conf={decoder_confidence:.2f})"
+        # Keep transformer pitch — only update confidence to reflect uncertainty
+        note["pitch_confidence"] = min(decoder_confidence, 0.7)
+
+
+def _override_pitch(note: dict, geo_midi: int, reason: str) -> None:
+    """Override a note's pitch with the geometric value."""
+    note["pitch"] = geo_midi
+    note["pitch_source"] = reason
+    # Recalculate pitch name from MIDI
+    octave_new = (geo_midi // 12) - 1
+    semitone = geo_midi % 12
+    names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    note["pitch_name"] = f"{names[semitone]}{octave_new}"
+    # Set confidence low to signal that correction was applied
+    note["pitch_confidence"] = 0.3
 
 
 def determine_clef_from_positions(

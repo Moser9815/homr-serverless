@@ -7,7 +7,7 @@ and note pixel positions from the segmentation pipeline.
 This code is licensed under AGPL-3.0 to comply with HOMR's license.
 """
 
-HANDLER_VERSION = "3.0-geometric-pitch"
+HANDLER_VERSION = "4.0-confidence-pitch"
 
 import base64
 import io
@@ -31,6 +31,111 @@ from detect_voltas import detect_voltas
 from detect_repeats import detect_repeat_barlines, build_repeat_markers
 
 
+# ---------------------------------------------------------------------------
+# Monkey-patch: Capture per-note pitch/rhythm confidence from decoder logits
+# ---------------------------------------------------------------------------
+# The HOMR decoder outputs raw logits for 5 heads at each autoregressive
+# step (decoder_inference.py line 83). The top-k filter (lines 96-100)
+# then destroys the probability distribution. We intercept BEFORE top-k
+# to compute softmax on the raw logits, giving true model confidence.
+#
+# Thread-local storage holds per-symbol confidence lists. The patched
+# generate() populates them; the handler reads them after each call to
+# parse_staffs(). Cleared between runs.
+#
+# This avoids modifying the installed HOMR package directly.
+# ---------------------------------------------------------------------------
+
+import threading
+
+_confidence_store = threading.local()
+
+
+def _get_confidence_store() -> list:
+    """Get the per-symbol confidence list for the current thread."""
+    if not hasattr(_confidence_store, "symbols"):
+        _confidence_store.symbols = []
+    return _confidence_store.symbols
+
+
+def _clear_confidence_store():
+    """Reset confidence store before a new run."""
+    _confidence_store.symbols = []
+
+
+def _install_confidence_patch():
+    """Monkey-patch ScoreDecoder.generate to capture raw logit confidence.
+
+    Must be called AFTER HOMR's imports so the class exists.
+    Idempotent — safe to call multiple times.
+    """
+    from homr.transformer.decoder_inference import ScoreDecoder
+    from homr.transformer.utils import softmax as _softmax
+
+    if getattr(ScoreDecoder, "_confidence_patched", False):
+        return  # Already patched
+
+    _original_generate = ScoreDecoder.generate
+
+    def _patched_generate(self, start_tokens, nonote_tokens,
+                          temperature=1.0, filter_thres=0.7, **kwargs):
+        """Wraps the original generate() to capture raw logit confidence
+        per symbol before top-k filtering distorts the distribution."""
+        import numpy as np
+
+        # We need to intercept the per-step logits inside the loop.
+        # Strategy: temporarily replace self.net.run to capture outputs.
+        _original_run = self.net.run
+        step_confidences = []
+
+        def _capturing_run(output_names, input_feed):
+            results = _original_run(output_names, input_feed)
+            # results order: rhythmsp, pitchsp, liftsp, positionsp,
+            #                articulationsp, attention, *cache
+            if len(results) >= 5:
+                rhythmsp = results[0]
+                pitchsp = results[1]
+                # Compute softmax on raw (pre-filter) logits
+                raw_pitch_probs = _softmax(pitchsp[:, -1, :], dim=-1)
+                raw_rhythm_probs = _softmax(rhythmsp[:, -1, :], dim=-1)
+                # Flatten to 1-D
+                pitch_flat = raw_pitch_probs.ravel()
+                rhythm_flat = raw_rhythm_probs.ravel()
+                # Top-3 pitch alternatives
+                top3_idx = np.argsort(pitch_flat)[-3:][::-1]
+                top3 = [(int(idx), float(pitch_flat[idx])) for idx in top3_idx]
+                step_confidences.append({
+                    "pitch_confidence": float(pitch_flat.max()),
+                    "rhythm_confidence": float(rhythm_flat.max()),
+                    "pitch_top3": top3,
+                })
+            return results
+
+        self.net.run = _capturing_run
+        try:
+            symbols = _original_generate(
+                self, start_tokens, nonote_tokens,
+                temperature=temperature, filter_thres=filter_thres,
+                **kwargs,
+            )
+        finally:
+            self.net.run = _original_run
+
+        # Store confidence alongside symbols in thread-local
+        store = _get_confidence_store()
+        for i, sym in enumerate(symbols):
+            conf = step_confidences[i] if i < len(step_confidences) else {
+                "pitch_confidence": 0.5, "rhythm_confidence": 0.5, "pitch_top3": [],
+            }
+            store.append(conf)
+
+        return symbols
+
+    ScoreDecoder.generate = _patched_generate
+    ScoreDecoder._confidence_patched = True
+    print("[HOMR] Confidence monkey-patch installed on ScoreDecoder.generate")
+
+
 def decode_image(base64_data: str) -> Image.Image:
     """Decode base64 image data to PIL Image, handling EXIF orientation."""
     image_bytes = base64.b64decode(base64_data)
@@ -52,6 +157,10 @@ def run_homr_api(image_path: str, use_gpu: bool = True) -> tuple:
     - barline_info: list of barline dicts with pixel positions
     - note_info: list of note dicts with pixel positions
     """
+    # Install confidence extraction monkey-patch (idempotent)
+    _install_confidence_patch()
+    _clear_confidence_store()
+
     # Import HOMR internals
     from homr.main import (
         ProcessingConfig,
@@ -401,23 +510,38 @@ def handler(event):
                 default_time_signature=time_signature,
             )
 
-            # Pitch correction DISABLED — the global zip approach causes
-            # regressions due to phantom-misaligned pairing. The transformer
-            # is ~95% correct; overriding based on fragile correlation
-            # introduces more errors than it fixes. Future fix: Option 2
-            # (reconcile inside HOMR's staff_parsing.py where both data
-            # sources are in natural scope) or beam search decoding.
-            # See docs/OMR_IMPROVEMENT_ANALYSIS.md for the full plan.
-            parsed["metadata"]["pitch_corrections"] = "disabled"
+            # --- Step 0: Apply captured confidence data to parsed notes ---
+            # Replace hardcoded confidence: 0.9 with actual pitch confidence
+            # from the decoder's raw logits (captured by monkey-patch).
+            # This MUST run first so downstream steps can use pitch_confidence.
+            confidence_data = _get_confidence_store()
+            conf_applied = 0
+            if confidence_data:
+                parsed_notes = parsed.get("notes", [])
+                # Confidence store has one entry per decoder symbol across
+                # ALL staves. Parsed notes are in the same sequential order
+                # as the decoder produced them. Match by index.
+                for i, note in enumerate(parsed_notes):
+                    if i < len(confidence_data):
+                        cd = confidence_data[i]
+                        note["confidence"] = cd["pitch_confidence"]
+                        note["pitch_confidence"] = cd["pitch_confidence"]
+                        note["rhythm_confidence"] = cd["rhythm_confidence"]
+                        note["pitch_alternatives"] = cd.get("pitch_top3", [])
+                        conf_applied += 1
+                print(f"[HOMR] Applied confidence data to {conf_applied}/{len(parsed_notes)} notes "
+                      f"(store had {len(confidence_data)} entries)")
+            else:
+                print("[HOMR] No confidence data captured (monkey-patch may not have fired)")
 
-            # Post-process step 0: geometric clef detection + pitch recomputation
+            # --- Step 0b: geometric clef detection + pitch recomputation ---
             # HOMR's transformer sometimes gets the clef wrong, which shifts all pitches.
             # Use visual analysis of the clef region to validate/correct.
             # Only override when we have HIGH confidence — avoid false positives.
             geometric_clef_status = "skipped"
             try:
                 from clef_classifier import find_clef_for_staff
-                from pitch_from_position import recompute_pitches
+                from pitch_from_position import recompute_pitches_with_confidence
 
                 import cv2 as _cv2
                 original_img = _cv2.imread(tmp_path)
@@ -452,13 +576,18 @@ def handler(event):
                 else:
                     geometric_clef_status = f"no_visual,keeping:{transformer_clef}"
 
-                # If overriding, recompute pitches from note positions
+                # If overriding, recompute pitches using the unified cursor-matching
+                # algorithm (not the old naive global-zip recompute_pitches).
                 if determined_clef != transformer_clef:
                     print(f"[HOMR] Clef override: {transformer_clef} → {determined_clef}")
                     fifths_str = parsed.get("metadata", {}).get("fifths", 0)
                     fifths = int(fifths_str) if fifths_str else 0
-                    parsed["notes"] = recompute_pitches(
-                        parsed["notes"], note_info, determined_clef, fifths
+                    # Build a clef_changes list with only the overridden clef
+                    override_clef_changes = [{"staff": 1, "measure": 1, "clef": determined_clef}]
+                    override_staff_clefs = {1: determined_clef}
+                    parsed["notes"] = recompute_pitches_with_confidence(
+                        parsed["notes"], homr_buckets, override_clef_changes,
+                        fifths=fifths, staff_clefs_default=override_staff_clefs,
                     )
                     parsed["metadata"]["clef"] = determined_clef
                     parsed["metadata"]["clef_override"] = True
@@ -470,7 +599,38 @@ def handler(event):
                 geometric_clef_status = f"error: {e}"
                 traceback.print_exc()
 
-            # Post-process step 1: classify barlines as repeat/normal
+            # --- Step 1: Geometric pitch cross-check ---
+            # Selective override: only correct transformer pitch when
+            # geometric position disagrees by >= 7 semitones (obvious error)
+            # or when disagreement < 7 AND pitch_confidence < 0.5.
+            # Feature-flagged for safe rollout. Runs AFTER clef override
+            # so it benefits from corrected clef when applicable.
+            geometric_pitch_enabled = os.environ.get("GEOMETRIC_PITCH_ENABLED", "true").lower() == "true"
+            pitch_correction_status = "disabled"
+            if geometric_pitch_enabled and homr_buckets:
+                try:
+                    from pitch_from_position import recompute_pitches_with_confidence
+                    clef_changes_list = parsed.get("metadata", {}).get("clef_changes", []) or []
+                    fifths_val = int(parsed.get("metadata", {}).get("fifths", 0) or 0)
+                    staff_clefs_default = {}
+                    raw_staff_clefs = parsed.get("metadata", {}).get("staff_clefs")
+                    if raw_staff_clefs:
+                        staff_clefs_default = {int(k): v for k, v in raw_staff_clefs.items()}
+
+                    parsed["notes"] = recompute_pitches_with_confidence(
+                        parsed["notes"],
+                        homr_buckets,
+                        clef_changes_list,
+                        fifths=fifths_val,
+                        staff_clefs_default=staff_clefs_default,
+                    )
+                    pitch_correction_status = "enabled"
+                except Exception as e:
+                    pitch_correction_status = f"error: {e}"
+                    traceback.print_exc()
+            parsed["metadata"]["pitch_corrections"] = pitch_correction_status
+
+            # Post-process step 2a: classify barlines as repeat/normal
             # using image-based dot detection (replaces HOMR's unreliable transformer)
             total_m = parsed.get("metadata", {}).get("total_measures", 0)
             repeat_status = "skipped"
@@ -500,7 +660,7 @@ def handler(event):
                 repeat_status = f"error: {e}"
                 traceback.print_exc()
 
-            # Post-process step 2: detect voltas (augments repeat markers)
+            # Post-process step 2b: detect voltas (augments repeat markers)
             volta_status = "skipped"
             try:
                 repeat_markers = detect_voltas(
@@ -553,8 +713,8 @@ def handler(event):
             }
 
         finally:
-            for path in [tmp_path, tmp_path.replace(".png", ".musicxml"),
-                         tmp_path.replace(".png", ".xml")]:
+            base = os.path.splitext(tmp_path)[0]
+            for path in [tmp_path, base + ".musicxml", base + ".xml"]:
                 if os.path.exists(path):
                     os.unlink(path)
 
