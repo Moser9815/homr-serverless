@@ -605,7 +605,7 @@ def handler(event):
             # or when disagreement < 7 AND pitch_confidence < 0.5.
             # Feature-flagged for safe rollout. Runs AFTER clef override
             # so it benefits from corrected clef when applicable.
-            geometric_pitch_enabled = os.environ.get("GEOMETRIC_PITCH_ENABLED", "true").lower() == "true"
+            geometric_pitch_enabled = os.environ.get("GEOMETRIC_PITCH_ENABLED", "false").lower() == "true"
             pitch_correction_status = "disabled"
             if geometric_pitch_enabled and homr_buckets:
                 try:
