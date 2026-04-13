@@ -62,6 +62,7 @@ COPY detect_repeats.py .
 COPY detect_voltas.py .
 COPY clef_classifier.py .
 COPY pitch_from_position.py .
+COPY spatial_pitch_alignment.py .
 COPY clef_model.pkl .
 
 CMD ["python3", "-u", "handler.py"]
