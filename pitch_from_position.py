@@ -129,11 +129,11 @@ def recompute_pitches_with_confidence(
     fifths: int = 0,
     staff_clefs_default: dict | None = None,
 ) -> list[dict]:
-    """Second-pass pitch resolution with per-bucket matching and selective override.
+    """Second-pass pitch resolution with spatial matching and selective override.
 
     For each parsed note, find the best-matching segmentation entry in the
-    same (staff, measure) bucket by pitch proximity. Then apply confidence-
-    weighted selective override rules.
+    same (staff, measure) bucket by spatial position order (beat vs x-coordinate).
+    Then apply confidence-weighted selective override rules.
 
     Key design decisions (from 3-agent expert review):
     - Per-bucket matching prevents phantom-cascade errors (vs old cursor approach)
@@ -214,7 +214,7 @@ def recompute_pitches_with_confidence(
             continue
 
         # Per-bucket matching: match parsed notes to bucket entries by
-        # pitch proximity. Greedy assignment, smallest cost first.
+        # spatial position order (beat-to-x proportionality). No pitch used.
         matches = _match_notes_to_entries(
             parsed_list, bucket_entries, effective_clef
         )
@@ -321,43 +321,121 @@ def _match_notes_to_entries(
     bucket_entries: list[dict],
     effective_clef: str,
 ) -> list[tuple[dict, dict]]:
-    """Match parsed notes to segmentation entries by pitch proximity.
+    """Match parsed notes to segmentation entries by spatial position order.
 
-    Greedy assignment: compute cost matrix of |transformer_midi - geometric_midi|
-    for all pairs, then assign in order of increasing cost. Each note and entry
-    can only be used once. Skip any pair with cost > 12 semitones (phantom).
+    Within a (staff, measure) bucket, both lists should be in left-to-right
+    order. We match by position order, NOT by pitch proximity, to break the
+    circularity of using transformer pitch to match against the data that
+    is supposed to correct transformer pitch.
+
+    Approach:
+    1. Sort parsed notes by (beat, -pitch) — left-to-right, high-to-low for chords
+    2. Sort bucket entries by (x, y) — left-to-right, top-to-bottom for chords
+    3. Use Needleman-Wunsch DP with zero match cost to align in order
+    4. The DP handles length mismatches by inserting gaps (phantom/missed)
+
+    The key insight: both lists are already in the SAME spatial order
+    (left-to-right). We just need to handle length differences (phantoms
+    in entries, missed notes in parsed) without using pitch for matching.
 
     Returns list of (parsed_note, bucket_entry) pairs.
     """
-    # Build cost matrix
-    costs = []
-    for i, note in enumerate(parsed_list):
-        t_midi = note.get("pitch_original_transformer") or note.get("pitch") or 0
-        for j, entry in enumerate(bucket_entries):
-            pos = entry.get("position")
-            if pos is None:
-                continue
-            _, g_midi = _diatonic_pitch(int(pos), effective_clef)
-            diff = abs(int(t_midi) - g_midi)
-            # Reduce cost for same pitch class (octave errors are common)
-            if int(t_midi) % 12 == g_midi % 12 and diff > 0:
-                diff = min(diff, 2)  # Treat octave errors as small cost
-            costs.append((diff, i, j))
+    if not parsed_list or not bucket_entries:
+        return []
 
-    # Sort by cost (smallest first) and greedily assign
-    costs.sort()
-    used_notes = set()
-    used_entries = set()
+    # Filter out entries with no position data
+    valid_entries = [e for e in bucket_entries if e.get("position") is not None]
+    if not valid_entries:
+        return []
+
+    # Sort parsed notes by (beat, descending pitch) — chords: highest pitch first
+    sorted_parsed = sorted(
+        enumerate(parsed_list),
+        key=lambda ip: (
+            ip[1].get("beat", 0),
+            -(ip[1].get("pitch_original_transformer") or ip[1].get("pitch") or 0),
+        ),
+    )
+
+    # Sort entries by (x, y) — left to right, top to bottom within a chord
+    sorted_entries = sorted(
+        enumerate(valid_entries),
+        key=lambda ie: (ie[1].get("x", 0), ie[1].get("y", 0)),
+    )
+
+    n_parsed = len(sorted_parsed)
+    n_entries = len(sorted_entries)
+
+    # --- Needleman-Wunsch DP alignment with spatial proportionality ---
+    # Both lists are in the same left-to-right order. We use the proportional
+    # position (beat within beat range vs x within x range) to distinguish
+    # which entries should match which parsed notes. NO pitch is used.
+    #
+    # The cost of matching parsed[i] to entry[j] is based on how far apart
+    # their normalized positions are. This lets the DP correctly skip
+    # phantom entries that don't correspond to any parsed note.
+    GAP_PENALTY = 2  # Cost of skipping (phantom or missed)
+
+    # Extract beat and x ranges for normalization
+    beats = [sorted_parsed[i][1].get("beat", 0) for i in range(n_parsed)]
+    xs = [sorted_entries[j][1].get("x", 0) for j in range(n_entries)]
+
+    min_beat = min(beats) if beats else 0
+    max_beat = max(beats) if beats else 1
+    beat_range = max_beat - min_beat if max_beat > min_beat else 1.0
+
+    min_x = min(xs) if xs else 0
+    max_x = max(xs) if xs else 1
+    x_range = max_x - min_x if max_x > min_x else 1.0
+
+    # Pre-compute match costs
+    match_costs = [[0.0] * n_entries for _ in range(n_parsed)]
+    for i in range(n_parsed):
+        norm_beat = (beats[i] - min_beat) / beat_range
+        for j in range(n_entries):
+            norm_x = (xs[j] - min_x) / x_range
+            # Cost = proportional distance, scaled to be comparable to gap penalty
+            # Small proportional distance = good match, large = bad match
+            cost = abs(norm_beat - norm_x) * GAP_PENALTY * 1.5
+            match_costs[i][j] = min(cost, GAP_PENALTY - 0.01)  # Cap below gap penalty
+
+    # DP table: dp[i][j] = min cost to align parsed[0:i] with entries[0:j]
+    dp = [[0.0] * (n_entries + 1) for _ in range(n_parsed + 1)]
+    for i in range(1, n_parsed + 1):
+        dp[i][0] = i * GAP_PENALTY
+    for j in range(1, n_entries + 1):
+        dp[0][j] = j * GAP_PENALTY
+
+    for i in range(1, n_parsed + 1):
+        for j in range(1, n_entries + 1):
+            dp[i][j] = min(
+                dp[i-1][j-1] + match_costs[i-1][j-1],  # Match
+                dp[i-1][j] + GAP_PENALTY,                # Skip parsed (missed)
+                dp[i][j-1] + GAP_PENALTY,                # Skip entry (phantom)
+            )
+
+    # Traceback
+    i, j = n_parsed, n_entries
+    alignment = []
+    while i > 0 or j > 0:
+        if (i > 0 and j > 0 and
+                abs(dp[i][j] - (dp[i-1][j-1] + match_costs[i-1][j-1])) < 1e-9):
+            alignment.append((i-1, j-1))
+            i -= 1
+            j -= 1
+        elif i > 0 and abs(dp[i][j] - (dp[i-1][j] + GAP_PENALTY)) < 1e-9:
+            i -= 1  # Skip parsed
+        else:
+            j -= 1  # Skip entry (phantom)
+
+    alignment.reverse()
+
+    # Convert alignment back to original indices
     matches = []
-
-    for diff, i, j in costs:
-        if diff > 12:
-            break  # Remaining pairs are too far apart — likely phantoms
-        if i in used_notes or j in used_entries:
-            continue
-        matches.append((parsed_list[i], bucket_entries[j]))
-        used_notes.add(i)
-        used_entries.add(j)
+    for pi, ej in alignment:
+        _, parsed_note = sorted_parsed[pi]
+        _, entry = sorted_entries[ej]
+        matches.append((parsed_note, entry))
 
     return matches
 
@@ -365,13 +443,14 @@ def _match_notes_to_entries(
 def _apply_selective_override(note: dict, homr_entry: dict, effective_clef: str) -> None:
     """Apply confidence-weighted selective pitch override for a single note.
 
-    Override rules:
+    Override rules (checked in order):
       - Exact agreement (diff == 0): keep transformer, confidence boosted
       - 1-semitone diff: keep transformer (likely accidental)
+      - Octave error (diff >= 11, pitch class within 1): keep transformer's
+        pitch class + geometric's octave (preserves accidentals)
       - Disagree >= 7 semitones: OVERRIDE with geometric
       - Disagree < 7 AND pitch_confidence < 0.5: OVERRIDE with geometric
       - Disagree < 7 AND pitch_confidence >= 0.5: FLAG but don't override
-      - Preserve transformer's accidental knowledge (geometric is diatonic only)
     """
     position = homr_entry.get("position")
     if position is None:
@@ -393,6 +472,24 @@ def _apply_selective_override(note: dict, homr_entry: dict, effective_clef: str)
         return
 
     decoder_confidence = note.get("pitch_confidence", 0.9)
+
+    # --- Step 4: Octave-aware override ---
+    # When the transformer has the right pitch class (note name + accidental)
+    # but wrong octave, keep the transformer's pitch class and use the
+    # geometric pitch's octave. The geometric system is diatonic-only, so
+    # the pitch classes may differ by up to 1 semitone (e.g., Eb vs D or E).
+    # Check: diff >= 11 AND pitch class difference <= 1 semitone.
+    if diff >= 11:
+        pitch_class_diff = abs(t_midi % 12 - geo_midi % 12)
+        pitch_class_diff = min(pitch_class_diff, 12 - pitch_class_diff)
+        if pitch_class_diff <= 1:
+            # Octave error: keep transformer's pitch class, use geometric's octave
+            new_midi = (geo_midi // 12) * 12 + (t_midi % 12)
+            _override_pitch(
+                note, new_midi,
+                f"octave_fix:trans_class+geo_octave(diff={diff},t={t_midi},g={geo_midi})"
+            )
+            return
 
     if diff >= 7:
         _override_pitch(note, geo_midi, f"geometric:hallucination(diff={diff})")

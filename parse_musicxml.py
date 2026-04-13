@@ -169,6 +169,85 @@ def _infer_time_signature(notes: list[dict], rests: list[dict]) -> str | None:
         return f"{int(beats)}/4"
 
 
+def validate_measure_beats(
+    notes: list[dict],
+    rests: list[dict],
+    time_signature: str,
+    tolerance: float = 0.1,
+) -> list[dict]:
+    """Validate that each measure's total duration matches the time signature.
+
+    Groups notes and rests by (staff, measure, voice), sums duration_beats,
+    and flags measures where the total differs from expected by more than
+    tolerance.
+
+    For compound meters (6/8, 9/8, 12/8), expected beats = numerator / (beat_unit / 4).
+    For simple meters (4/4, 3/4, 2/4), expected beats = numerator.
+
+    Chord notes (same beat position) are counted only ONCE per beat position
+    to avoid double-counting polyphonic notes that stack vertically.
+
+    Args:
+        notes: Parsed note dicts with 'measure', 'staff', 'voice', 'duration_beats', 'beat'
+        rests: Parsed rest dicts with same fields
+        time_signature: e.g. "4/4", "6/8", "3/4"
+        tolerance: Maximum acceptable deviation from expected beats
+
+    Returns:
+        List of flag dicts: {measure, staff, voice, expected, actual, status}
+    """
+    from collections import defaultdict
+
+    # Parse time signature to get expected beats per measure
+    ts_parts = time_signature.split("/")
+    numerator = int(ts_parts[0])
+    denominator = int(ts_parts[1])
+    # Convert to quarter-note beats: numerator * (4 / denominator)
+    expected_beats = numerator * (4.0 / denominator)
+
+    # Group items by (staff, measure, voice) and track beat positions
+    # For each group, collect (beat, duration_beats) pairs.
+    # Chord notes share the same beat position — only count duration once per beat.
+    groups: dict[tuple[int, int, int], dict[float, float]] = defaultdict(dict)
+
+    for item in notes + rests:
+        staff = item.get("staff", 1)
+        measure = item.get("measure", 1)
+        voice = item.get("voice", 1)
+        dur = item.get("duration_beats", 0)
+        beat = item.get("beat", 0)
+
+        if dur <= 0:
+            continue
+
+        key = (staff, measure, voice)
+        # For chord notes at the same beat, keep the longest duration
+        # (they're simultaneous, not sequential)
+        if beat in groups[key]:
+            groups[key][beat] = max(groups[key][beat], dur)
+        else:
+            groups[key][beat] = dur
+
+    # Check each group
+    flags = []
+    for (staff, measure, voice), beat_durations in sorted(groups.items()):
+        actual = sum(beat_durations.values())
+        deviation = abs(actual - expected_beats)
+
+        if deviation > tolerance:
+            status = "overfull" if actual > expected_beats else "underfull"
+            flags.append({
+                "measure": measure,
+                "staff": staff,
+                "voice": voice,
+                "expected": round(expected_beats, 4),
+                "actual": round(actual, 4),
+                "status": status,
+            })
+
+    return flags
+
+
 def duration_type_name(type_text: str, dots: int = 0) -> str:
     base_map = {
         "whole": "whole",
@@ -401,11 +480,17 @@ def parse_musicxml_to_json(
     # Track step+alter patterns for key inference
     step_alter_counts: dict[str, dict[int, int]] = {}
 
-    for part in parts:
+    for part_index, part in enumerate(parts):
         measures = findall(part, "measure")
 
-        # Extract repeats and voltas from barlines
-        repeat_markers = _extract_repeats_and_voltas(measures, ns)
+        # Extract repeats and voltas from barlines (only from first part)
+        if part_index == 0:
+            repeat_markers = _extract_repeats_and_voltas(measures, ns)
+
+        # For multi-part grand staff output (from split transformer),
+        # part 0 = staff 1 (treble), part 1 = staff 2 (bass), etc.
+        # Each part's internal staff numbers start at 1, so we offset.
+        staff_offset = part_index  # 0 for first part, 1 for second, etc.
 
         current_time = 0.0
         current_beat = 1.0
@@ -452,6 +537,9 @@ def parse_musicxml_to_json(
                     else:
                         clef_name = "treble"
                     clef_num = int(clef_el.get("number", "1"))
+                    # Multi-part offset for clef tracking
+                    if len(parts) > 1:
+                        clef_num += staff_offset
 
                     # Initial clef per staff (for back-compat `staff_clefs`)
                     if clef_num not in staff_clefs:
@@ -505,6 +593,23 @@ def parse_musicxml_to_json(
                     dots = len(findall(note_el, "dot"))
 
                     dur_beats = duration_beats(type_text, dots)
+
+                    # Check for tuplet (e.g., triplet) via <time-modification>
+                    is_tuplet = False
+                    tuplet_actual = 1
+                    tuplet_normal = 1
+                    time_mod = find(note_el, "time-modification")
+                    if time_mod is not None:
+                        actual_el = find(time_mod, "actual-notes")
+                        normal_el = find(time_mod, "normal-notes")
+                        if actual_el is not None and actual_el.text:
+                            tuplet_actual = int(actual_el.text)
+                        if normal_el is not None and normal_el.text:
+                            tuplet_normal = int(normal_el.text)
+                        if tuplet_actual > 1:
+                            is_tuplet = True
+                            dur_beats = dur_beats * tuplet_normal / tuplet_actual
+
                     dur_seconds = dur_beats * seconds_per_beat
 
                     # Extract articulations
@@ -517,6 +622,9 @@ def parse_musicxml_to_json(
                     note_voice = int(voice_el.text) if voice_el is not None and voice_el.text else 1
                     staff_el = find(note_el, "staff")
                     note_staff = int(staff_el.text) if staff_el is not None and staff_el.text else 1
+                    # Multi-part offset: part 1's staff 1 = staff 2 in combined output
+                    if len(parts) > 1:
+                        note_staff += staff_offset
 
                     # Chord notes use the beat/time of the previous non-chord note
                     if is_chord:
@@ -570,6 +678,7 @@ def parse_musicxml_to_json(
                                     "end_time": round(note_time + grace_dur, 4),
                                     "duration": grace_dur,
                                     "duration_type": duration_type_name(type_text, dots),
+                                    "duration_beats": round(dur_beats, 4),
                                     "beat": round(note_beat, 4),
                                     "measure": measure_number,
                                     "confidence": 0.9,
@@ -585,12 +694,17 @@ def parse_musicxml_to_json(
                                     "end_time": round(note_time + dur_seconds, 4),
                                     "duration": round(dur_seconds, 4),
                                     "duration_type": duration_type_name(type_text, dots),
+                                    "duration_beats": round(dur_beats, 4),
                                     "beat": round(note_beat, 4),
                                     "measure": measure_number,
                                     "confidence": 0.9,
                                     "voice": note_voice,
                                     "staff": note_staff,
                                 }
+                            if is_tuplet:
+                                note_entry["is_tuplet"] = True
+                                note_entry["tuplet_actual"] = tuplet_actual
+                                note_entry["tuplet_normal"] = tuplet_normal
                             if arts:
                                 note_entry["articulations"] = arts
 
@@ -620,8 +734,8 @@ def parse_musicxml_to_json(
                         if current_time < 0:
                             current_time = max(0, current_time)
 
-        # Only process first part
-        break
+        # Multi-part: continue to process next part (e.g., grand staff split)
+        # Previously this was `break` to only process the first part.
 
     # Override MusicXML metadata with values inferred from actual notes.
     # HOMR's MusicXML attributes are often wrong (e.g. treble for bass clef,
@@ -649,6 +763,11 @@ def parse_musicxml_to_json(
     if detected_key in FIFTHS_TO_KEY.values():
         key_display = f"{detected_key} major"
 
+    # Step 5: Validate measure beat totals
+    measure_flags = validate_measure_beats(
+        notes_out, rests_out, detected_time_sig
+    )
+
     return {
         "notes": notes_out,
         "rests": rests_out,
@@ -668,5 +787,7 @@ def parse_musicxml_to_json(
             "is_grand_staff": len(staff_clefs) > 1,
             "staff_clefs": {str(k): v for k, v in staff_clefs.items()} if staff_clefs else None,
             "clef_changes": clef_changes if clef_changes else None,
+            "measure_flags": measure_flags if measure_flags else None,
+            "flagged_measure_count": len(measure_flags),
         },
     }
